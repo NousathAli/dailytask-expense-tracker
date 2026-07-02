@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "DailyTask",
+    "slug": "DailyTask",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0E3B43"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0E3B43"
+      },
+      "package": "com.nousath.dailytask",
+      "versionCode": 9,
+      "edgeToEdgeEnabled": true
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sharing",
+      "expo-document-picker",
+      "expo-image-picker",
+      "expo-splash-screen"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "ca09a310-a487-4190-a61c-081826987290"
+      }
+    }
+  }
+}
