@@ -1199,6 +1199,11 @@ export default function App() {
   const [editAttendanceNote, setEditAttendanceNote] = useState("");
   const [showDutySettings, setShowDutySettings] = useState(false);
   const [attendanceHistoryFilter, setAttendanceHistoryFilter] = useState("All");
+  const [attendanceDrilldown, setAttendanceDrilldown] = useState({
+    type: "",
+    title: "",
+    subtitle: "",
+  });
 
   const [tasks, setTasks] = useState([]);
   const [newTask, setNewTask] = useState(emptyTask);
@@ -1280,6 +1285,16 @@ export default function App() {
   const carryForwardBalance = useMemo(
     () => getCarryForwardBalance(attendanceRecords, attendanceMonth.year, attendanceMonth.monthIndex),
     [attendanceRecords, attendanceMonth]
+  );
+
+  const attendanceDrilldownSummary = useMemo(
+    () => getAttendanceDrilldownSummary(monthRecords),
+    [monthRecords]
+  );
+
+  const attendanceDrilldownRecords = useMemo(
+    () => getAttendanceDrilldownRecords(monthRecords, attendanceDrilldown.type),
+    [monthRecords, attendanceDrilldown.type]
   );
 
   const pettyOpenPeriod = useMemo(
@@ -2014,6 +2029,7 @@ export default function App() {
     if (screen === "changePassword") return setScreen("profile");
     if (screen === "attendance") return setScreen("dashboard");
     if (screen === "attendanceHistory") return setScreen("attendance");
+    if (screen === "attendanceDrilldown") return setScreen("attendance");
     if (screen === "editAttendance") return setScreen("attendance");
     if (screen === "tasks") return setScreen("dashboard");
     if (screen === "completedTasks") return setScreen("tasks");
@@ -2698,6 +2714,11 @@ export default function App() {
   function moveAttendanceMonth(direction) {
     const nextDate = new Date(attendanceMonth.year, attendanceMonth.monthIndex + direction, 1);
     setAttendanceMonth({ year: nextDate.getFullYear(), monthIndex: nextDate.getMonth() });
+  }
+
+  function openAttendanceDrilldown(type, title, subtitle = "") {
+    setAttendanceDrilldown({ type, title, subtitle });
+    setScreen("attendanceDrilldown");
   }
 
   async function writeWorkbookAndShare(workbook, baseFileName, dialogTitle) {
@@ -5068,11 +5089,85 @@ export default function App() {
           </View>
           <Text style={styles.sectionMiniTitle}>Carry Forward Balance</Text>
           <View style={styles.summaryGrid}>
-            <SummaryCard title="Pending Off" value={String(carryForwardBalance.pendingClosing)} subtitle="Closing" />
-            <SummaryCard title="PH Balance" value={String(carryForwardBalance.phClosing)} subtitle="Closing" />
-            <SummaryCard title="Extra Hours" value={minutesToReadable(carryForwardBalance.extraClosingMinutes)} subtitle="Closing" />
-            <SummaryCard title="PH Off" value={String(carryForwardBalance.phOffCount)} subtitle="This month" />
+            <SummaryCard
+              title="Pending Off"
+              value={String(carryForwardBalance.pendingClosing)}
+              subtitle="Closing balance"
+              onPress={() => openAttendanceDrilldown("Pending Off Taken", "Pending Off Taken", "Dates where pending off was used")}
+            />
+            <SummaryCard
+              title="PH Balance"
+              value={String(carryForwardBalance.phClosing)}
+              subtitle="Closing balance"
+              onPress={() => openAttendanceDrilldown("PH Comp Off Taken", "PH Comp Off Taken", "Dates where PH comp off was used")}
+            />
+            <SummaryCard
+              title="Extra Hours"
+              value={minutesToReadable(carryForwardBalance.extraClosingMinutes)}
+              subtitle="Closing balance"
+              onPress={() => openAttendanceDrilldown("Extra Earned", "Extra Hours Earned", "Dates with overtime earned")}
+            />
+            <SummaryCard
+              title="PH Off"
+              value={String(carryForwardBalance.phOffCount)}
+              subtitle="This month"
+              onPress={() => openAttendanceDrilldown("PH Off", "PH Off", "Public holiday off dates")}
+            />
           </View>
+
+          <Text style={styles.sectionMiniTitle}>Attendance Details Breakdown</Text>
+          <Text style={styles.noteHelpText}>Tap any card to see exact dates and details for this month.</Text>
+          <View style={styles.summaryGrid}>
+            <SummaryCard
+              title="Pending Off Taken"
+              value={String(attendanceDrilldownSummary.pendingOffTaken)}
+              subtitle="View dates"
+              onPress={() => openAttendanceDrilldown("Pending Off Taken", "Pending Off Taken", "Pending off used dates")}
+            />
+            <SummaryCard
+              title="Off Cancelled"
+              value={String(attendanceDrilldownSummary.offCancelled)}
+              subtitle="Pending earned"
+              onPress={() => openAttendanceDrilldown("Off Cancelled", "Off Cancelled", "Dates where off was cancelled")}
+            />
+            <SummaryCard
+              title="PH Worked"
+              value={String(attendanceDrilldownSummary.phWorked)}
+              subtitle="PH earned"
+              onPress={() => openAttendanceDrilldown("PH Worked", "PH Worked", "Public holiday worked dates")}
+            />
+            <SummaryCard
+              title="PH Comp Taken"
+              value={String(attendanceDrilldownSummary.phCompOffTaken)}
+              subtitle="PH used"
+              onPress={() => openAttendanceDrilldown("PH Comp Off Taken", "PH Comp Off Taken", "PH comp off used dates")}
+            />
+            <SummaryCard
+              title="Leave Days"
+              value={String(attendanceDrilldownSummary.leaveDays)}
+              subtitle="Annual/Sick/Emergency"
+              onPress={() => openAttendanceDrilldown("Leave Days", "Leave Days", "Leave dates in selected month")}
+            />
+            <SummaryCard
+              title="Late Days"
+              value={String(attendanceDrilldownSummary.lateDays)}
+              subtitle="After 08:30 AM"
+              onPress={() => openAttendanceDrilldown("Late Days", "Late Days", "Clock-in after duty start")}
+            />
+            <SummaryCard
+              title="Missing Punch"
+              value={String(attendanceDrilldownSummary.missingPunch)}
+              subtitle="Incomplete punch"
+              onPress={() => openAttendanceDrilldown("Missing Punch", "Missing Punch", "Missing clock-in or clock-out dates")}
+            />
+            <SummaryCard
+              title="Extra Used"
+              value={minutesToReadable(attendanceDrilldownSummary.extraUsedMinutes)}
+              subtitle="Hours used"
+              onPress={() => openAttendanceDrilldown("Extra Used", "Extra Hours Used", "Dates where extra hours were used")}
+            />
+          </View>
+
           <View style={styles.historyTitleRow}>
             <Text style={styles.sectionMiniTitle}>Recent Attendance History</Text>
             <Text style={styles.historyCountText}>{Math.min(monthRecords.length, 3)} / {monthRecords.length}</Text>
@@ -5093,6 +5188,64 @@ export default function App() {
             </Pressable>
           ) : null}
         </View>
+      </Page>
+    );
+  }
+
+  if (isLoggedIn && screen === "attendanceDrilldown") {
+    const drilldownTitle = attendanceDrilldown.title || "Attendance Details";
+    const drilldownSubtitle = attendanceDrilldown.subtitle || getMonthTitle(attendanceMonth.year, attendanceMonth.monthIndex);
+
+    return (
+      <Page
+        title={drilldownTitle}
+        subtitle={`${getMonthTitle(attendanceMonth.year, attendanceMonth.monthIndex)} • ${drilldownSubtitle}`}
+        onBack={goBack}
+      >
+        <View style={styles.editCard}>
+          <MonthNav
+            title={getMonthTitle(attendanceMonth.year, attendanceMonth.monthIndex)}
+            onPrev={() => moveAttendanceMonth(-1)}
+            onNext={() => moveAttendanceMonth(1)}
+          />
+          <View style={styles.historyFilterSummary}>
+            <InfoLine label="Selected Detail" value={drilldownTitle} />
+            <InfoLine label="Matching Dates" value={String(attendanceDrilldownRecords.length)} />
+          </View>
+          <Text style={styles.noteHelpText}>This page shows the exact dates behind the selected attendance summary card.</Text>
+        </View>
+
+        {attendanceDrilldownRecords.length === 0 ? (
+          <EmptyBox title="No matching dates" text="No attendance record found for this selection in the current month." />
+        ) : null}
+
+        {attendanceDrilldownRecords.map((record) => {
+          const rowData = buildAttendanceTimesheetRow(record);
+          const extraEarnedMinutes = record.checkIn && record.checkOut
+            ? calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours)
+            : 0;
+          const extraUsedMinutes = hoursTextToMinutes(record.extraHoursUsed);
+          const checkInMinutes = timeToMinutes(record.checkIn);
+          const checkOutMinutes = timeToMinutes(record.checkOut);
+          const lateMinutes = checkInMinutes !== null ? Math.max(checkInMinutes - DAILY_DUTY_START_MINUTES, 0) : 0;
+          const earlyMinutes = checkOutMinutes !== null ? Math.max(DAILY_DUTY_END_MINUTES - checkOutMinutes, 0) : 0;
+          const hasMissingPunch = isAttendanceMissingPunch(record);
+
+          return (
+            <View key={`${record.date}-${record.dayType}`} style={styles.historyRowLarge}>
+              <Text style={styles.historyTitle}>{formatDateForDisplay(record.date)} • {record.dayType}</Text>
+              <Text style={styles.historyText}>Clock In: {record.checkIn ? formatDisplayTime(record.checkIn) : "--"} • Clock Out: {record.checkOut ? formatDisplayTime(record.checkOut) : "--"}</Text>
+              <Text style={styles.historyText}>Status: {record.status || "--"}</Text>
+              <Text style={styles.historyText}>Work Time: {rowData.workTime} • Actual Time: {rowData.actualTime} • Overtime: {rowData.overtime}</Text>
+              {lateMinutes > 0 ? <Text style={styles.historyText}>Late: {minutesToReadable(lateMinutes)}</Text> : null}
+              {earlyMinutes > 0 ? <Text style={styles.historyText}>Early Out: {minutesToReadable(earlyMinutes)}</Text> : null}
+              {extraEarnedMinutes > 0 ? <Text style={styles.historyText}>Extra Earned: {minutesToReadable(extraEarnedMinutes)}</Text> : null}
+              {extraUsedMinutes > 0 ? <Text style={styles.historyText}>Extra Used: {minutesToReadable(extraUsedMinutes)}</Text> : null}
+              {hasMissingPunch ? <Text style={styles.historyText}>Missing Punch: Yes</Text> : null}
+              {record.note ? <Text style={styles.historyNote}>Notes: {record.note}</Text> : null}
+            </View>
+          );
+        })}
       </Page>
     );
   }
@@ -6064,7 +6217,17 @@ export default function App() {
 
         <View style={styles.editCard}>
           <Text style={styles.sectionMiniTitle}>Security Settings</Text>
-          <InfoLine label="Biometric Login" value={biometricEnabled ? "Enabled" : "Disabled"} />
+          <View style={styles.securityStatusCard}>
+            <View style={styles.securityIconBox}>
+              <Text style={styles.securityIconText}>{biometricEnabled ? "🔐" : "🔓"}</Text>
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.securityTitle}>Biometric Login</Text>
+              <Text style={styles.securitySubtitle}>
+                Status: {biometricEnabled ? "Enabled" : "Disabled"}
+              </Text>
+            </View>
+          </View>
           <Text style={styles.masterInfoText}>
             Enable this to login with fingerprint, face unlock or your phone lock on this device. Username/password login will still work.
           </Text>
@@ -6081,10 +6244,10 @@ export default function App() {
 
         <View style={styles.editCard}>
           <Text style={styles.sectionMiniTitle}>Development Details</Text>
+          <InfoLine label="App Name" value="DailyTask" />
+          <InfoLine label="Developed by" value="Nousath Ali" />
           <InfoLine label="Powered by" value="Crescent IT Solution" />
-          <InfoLine label="Developed by" value="NousathAli" />
           <InfoLine label="Email" value="nousath24@hotmail.com" />
-          <InfoLine label="App Mode" value="Local mobile storage" />
         </View>
 
         <View style={styles.editCard}>
@@ -6946,6 +7109,83 @@ function getMonthSummary(records) {
     if (record.checkIn && record.checkOut) extraMinutes += calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours);
   });
   return { totalRecords: records.length, workedDays, offDays, extraMinutes };
+}
+
+function isAttendanceWorkingType(record) {
+  return ["Work Day", "Off Cancelled", "PH Worked"].includes(record?.dayType || "Work Day");
+}
+
+function isAttendanceMissingPunch(record) {
+  if (!isAttendanceWorkingType(record)) return false;
+  const hasCheckIn = Boolean(record?.checkIn);
+  const hasCheckOut = Boolean(record?.checkOut);
+  return !hasCheckIn || !hasCheckOut;
+}
+
+function isAttendanceLate(record) {
+  if (!isAttendanceWorkingType(record)) return false;
+  const checkInMinutes = timeToMinutes(record?.checkIn);
+  if (checkInMinutes === null) return false;
+  return checkInMinutes > DAILY_DUTY_START_MINUTES;
+}
+
+function isAttendanceEarlyOut(record) {
+  if (!isAttendanceWorkingType(record)) return false;
+  const checkOutMinutes = timeToMinutes(record?.checkOut);
+  if (checkOutMinutes === null) return false;
+  return checkOutMinutes < DAILY_DUTY_END_MINUTES;
+}
+
+function isAttendanceLeaveDay(record) {
+  const dayType = record?.dayType || "";
+  return [
+    "Annual Leave",
+    "Sick Leave",
+    "Emergency Leave",
+    "Unpaid Leave",
+    "Other Leave",
+  ].includes(dayType);
+}
+
+function getAttendanceDrilldownSummary(records) {
+  const safeRecords = Array.isArray(records) ? records : [];
+  return {
+    pendingOffTaken: safeRecords.filter((record) => record.dayType === "Pending Off Taken").length,
+    offCancelled: safeRecords.filter((record) => record.dayType === "Off Cancelled").length,
+    phWorked: safeRecords.filter((record) => record.dayType === "PH Worked").length,
+    phCompOffTaken: safeRecords.filter((record) => record.dayType === "PH Comp Off Taken").length,
+    phOff: safeRecords.filter((record) => record.dayType === "PH Off").length,
+    leaveDays: safeRecords.filter(isAttendanceLeaveDay).length,
+    lateDays: safeRecords.filter(isAttendanceLate).length,
+    earlyOutDays: safeRecords.filter(isAttendanceEarlyOut).length,
+    missingPunch: safeRecords.filter(isAttendanceMissingPunch).length,
+    extraEarnedDays: safeRecords.filter((record) => record.checkIn && record.checkOut && calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours) > 0).length,
+    extraEarnedMinutes: safeRecords.reduce((sum, record) => (
+      sum + (record.checkIn && record.checkOut ? calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours) : 0)
+    ), 0),
+    extraUsedDays: safeRecords.filter((record) => hoursTextToMinutes(record.extraHoursUsed) > 0).length,
+    extraUsedMinutes: safeRecords.reduce((sum, record) => sum + hoursTextToMinutes(record.extraHoursUsed), 0),
+  };
+}
+
+function getAttendanceDrilldownRecords(records, type) {
+  const safeRecords = Array.isArray(records) ? records : [];
+
+  const matchedRecords = safeRecords.filter((record) => {
+    if (!type) return false;
+    if (ATTENDANCE_DAY_TYPES.includes(type)) return record.dayType === type;
+    if (type === "Leave Days") return isAttendanceLeaveDay(record);
+    if (type === "Late Days") return isAttendanceLate(record);
+    if (type === "Early Out") return isAttendanceEarlyOut(record);
+    if (type === "Missing Punch") return isAttendanceMissingPunch(record);
+    if (type === "Extra Earned") {
+      return record.checkIn && record.checkOut && calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours) > 0;
+    }
+    if (type === "Extra Used") return hoursTextToMinutes(record.extraHoursUsed) > 0;
+    return false;
+  });
+
+  return matchedRecords.sort((a, b) => String(a.date).localeCompare(String(b.date)));
 }
 
 function getCarryForwardBalance(records, year, monthIndex) {
@@ -7998,6 +8238,13 @@ const styles = StyleSheet.create({
   primaryButtonText: { color: "#FFFFFF", fontSize: 16, fontWeight: "800" },
   secondaryButton: { backgroundColor: "#E7F1F3", paddingVertical: 15, borderRadius: 13, alignItems: "center", marginTop: 12 },
   secondaryButtonText: { color: "#1597A5", fontSize: 16, fontWeight: "800" },
+  dangerSoftButton: { backgroundColor: "#FFE9DD", borderWidth: 1, borderColor: "#FFD0BE", paddingVertical: 15, borderRadius: 13, alignItems: "center", marginTop: 14 },
+  dangerSoftButtonText: { color: "#C75B39", fontSize: 16, fontWeight: "900" },
+  securityStatusCard: { backgroundColor: "#F4FBFC", borderWidth: 1, borderColor: "#DDECEF", borderRadius: 18, padding: 14, flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 8 },
+  securityIconBox: { width: 46, height: 46, borderRadius: 16, backgroundColor: "#DDF3F6", alignItems: "center", justifyContent: "center" },
+  securityIconText: { fontSize: 22 },
+  securityTitle: { color: "#17252A", fontSize: 15, fontWeight: "900" },
+  securitySubtitle: { color: "#55727B", fontSize: 12, fontWeight: "700", marginTop: 3 },
   dashboardButton: { backgroundColor: "#FFFFFF", paddingVertical: 15, borderRadius: 15, alignItems: "center", marginTop: 14, borderWidth: 1, borderColor: "#DDE8EC" },
   dashboardButtonText: { color: "#17252A", fontSize: 15, fontWeight: "900" },
   dangerButton: { backgroundColor: "#FFE9DD", paddingVertical: 15, borderRadius: 15, alignItems: "center", marginTop: 14 },
