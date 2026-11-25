@@ -18,8 +18,11 @@
         "backgroundColor": "#0E3B43"
       },
       "package": "com.nousath.dailytask",
-      "versionCode": 9,
-      "edgeToEdgeEnabled": true
+      "versionCode": 11,
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "android.permission.SCHEDULE_EXACT_ALARM"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -28,7 +31,8 @@
       "expo-sharing",
       "expo-document-picker",
       "expo-image-picker",
-      "expo-splash-screen"
+      "expo-splash-screen",
+      "expo-notifications"
     ],
     "extra": {
       "eas": {

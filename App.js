@@ -8,6 +8,15 @@ import * as LocalAuthentication from "expo-local-authentication";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import * as XLSX from "xlsx";
 import {
+  cancelLateClockOutReminders,
+  isLateClockOutTime,
+  scheduleLateClockOutReminders,
+  scheduleParkingReminders,
+  listenForReminderTaps,
+  scheduleBackupReminders,
+  cancelAllReminders,
+} from "./reminders";
+import {
   Alert,
   Animated,
   AppState,
@@ -838,6 +847,12 @@ const DEFAULT_SUPPLIERS = [
 const EXCEL_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const EXCEL_UTI = "org.openxmlformats.spreadsheetml.sheet";
 
+// On the phone this is the share sheet; in the browser preview files are downloaded instead.
+async function isExportAvailable() {
+  if (Platform.OS === "web") return true;
+  return Sharing.isAvailableAsync();
+}
+
 function sanitizeExportFileName(name) {
   return String(name || "DailyTask_Report")
     .replace(/[^a-zA-Z0-9_\-]/g, "_")
@@ -846,6 +861,8 @@ function sanitizeExportFileName(name) {
     .slice(0, 80);
 }
 
+// Exact column order of the Business Central "Lines" sheet (reference/Lines (7).xlsx).
+// Rows are built by header name (buildBcRow), so the order is defined here only.
 const BC_EXPORT_HEADERS = [
   "Line No.",
   "Expense Code",
@@ -854,27 +871,61 @@ const BC_EXPORT_HEADERS = [
   "Expense Date",
   "Work Description",
   "Vendor Name",
+  "Expense Amount (Excl. VAT)",
+  "Line amount",
   "Gen. Bus. Posting Group",
   "VAT Bus. Posting Group",
   "Gen. Prod. Posting Group",
   "VAT Prod. Posting Group",
-  "Expense Amount (Excl. VAT)",
-  "Line amount",
   "VAT %",
   "VAT Amount",
   "Amount Including VAT",
-  "Branch",
-  "Employee Code",
   "Invoice No.",
   "VAT No.",
+  "Branch",
+  "Employee Code",
   "Department Code",
   "Accommodation Code",
+  "Shortcut Dimension 6 Code",
+  "Shortcut Dimension 7 Code",
+  "Shortcut Dimension 8 Code",
   "Attachment",
   "Subtotal Excl. VAT (AED)",
   "Total Excl. VAT (AED)",
   "Total VAT (AED)",
   "Total Incl. VAT (AED)",
 ];
+
+const BC_COLUMN_WIDTHS = {
+  "Line No.": 10,
+  "Expense Code": 22,
+  "G/L No.": 12,
+  "G/L Description": 20,
+  "Expense Date": 14,
+  "Work Description": 60,
+  "Vendor Name": 26,
+  "Expense Amount (Excl. VAT)": 24,
+  "Line amount": 12,
+  "Gen. Bus. Posting Group": 22,
+  "VAT Bus. Posting Group": 22,
+  "Gen. Prod. Posting Group": 22,
+  "VAT Prod. Posting Group": 22,
+  "VAT %": 8,
+  "VAT Amount": 12,
+  "Amount Including VAT": 20,
+  "Invoice No.": 18,
+  "VAT No.": 16,
+  "Branch": 14,
+  "Department Code": 16,
+};
+
+// values: { "Header Name": value }. Unknown headers are rejected so a typo cannot shift data silently.
+function buildBcRow(values) {
+  Object.keys(values).forEach((key) => {
+    if (!BC_EXPORT_HEADERS.includes(key)) throw new Error(`Unknown BC column: ${key}`);
+  });
+  return BC_EXPORT_HEADERS.map((header) => (values[header] === undefined ? "" : values[header]));
+}
 
 const REIMBURSEMENT_BC_EXPORT_HEADERS = BC_EXPORT_HEADERS;
 
@@ -1151,6 +1202,14 @@ export default function App() {
   const [biometricEnabled, setBiometricEnabled] = useState(false);
   const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
   const [isSessionLocked, setIsSessionLocked] = useState(false);
+  const [lateClockOut, setLateClockOut] = useState(null); // { time, note } while the late note box is open
+  const [missedClockOut, setMissedClockOut] = useState(null); // { date, time, note } for a forgotten clock-out
+  const [lastBackupDate, setLastBackupDate] = useState(""); // "YYYY-MM-DD" of the last backup export
+  const [forgotVerified, setForgotVerified] = useState(false); // phone lock passed on Forgot Password
+  const [minuteTick, setMinuteTick] = useState(0); // re-renders the late banner every minute
+  const [pendingReminderScreen, setPendingReminderScreen] = useState(null); // screen to open from a tapped reminder
+  const [claimReceived, setClaimReceived] = useState(null); // { claimId, date } while "Payment Received" box is open
+  const [pettySubmissions, setPettySubmissions] = useState([]); // [{ id, month: "YYYY-MM", submittedDate }]
   const [unlockPassword, setUnlockPassword] = useState("");
 
   const floatAnim1 = useRef(new Animated.Value(0)).current;
@@ -1199,11 +1258,6 @@ export default function App() {
   const [editAttendanceNote, setEditAttendanceNote] = useState("");
   const [showDutySettings, setShowDutySettings] = useState(false);
   const [attendanceHistoryFilter, setAttendanceHistoryFilter] = useState("All");
-  const [attendanceDrilldown, setAttendanceDrilldown] = useState({
-    type: "",
-    title: "",
-    subtitle: "",
-  });
 
   const [tasks, setTasks] = useState([]);
   const [newTask, setNewTask] = useState(emptyTask);
@@ -1285,16 +1339,6 @@ export default function App() {
   const carryForwardBalance = useMemo(
     () => getCarryForwardBalance(attendanceRecords, attendanceMonth.year, attendanceMonth.monthIndex),
     [attendanceRecords, attendanceMonth]
-  );
-
-  const attendanceDrilldownSummary = useMemo(
-    () => getAttendanceDrilldownSummary(monthRecords),
-    [monthRecords]
-  );
-
-  const attendanceDrilldownRecords = useMemo(
-    () => getAttendanceDrilldownRecords(monthRecords, attendanceDrilldown.type),
-    [monthRecords, attendanceDrilldown.type]
   );
 
   const pettyOpenPeriod = useMemo(
@@ -1562,6 +1606,231 @@ export default function App() {
     loadSavedData();
   }, []);
 
+  // Phone reminders: scheduled while clocked in and not clocked out; cancelled otherwise.
+  // Runs again when the app opens, so reminders survive an app restart.
+  useEffect(() => {
+    if (!isStorageReady) return;
+    const isOpenDay = todayAttendance.date === getTodayKey() && todayAttendance.checkIn && !todayAttendance.checkOut;
+    if (isOpenDay) {
+      scheduleLateClockOutReminders(todayAttendance.date, todayAttendance.checkIn);
+    } else {
+      cancelLateClockOutReminders();
+    }
+  }, [isStorageReady, todayAttendance.date, todayAttendance.checkIn, todayAttendance.checkOut]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setMinuteTick((value) => value + 1), 60 * 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Evening parking reminder: refreshed whenever reimbursement entries change.
+  // Days that already have an entry get no reminder.
+  const reimbursementEntryDatesKey = useMemo(
+    () => Array.from(new Set(reimbursementRecords.map((record) => record.date))).sort().join(","),
+    [reimbursementRecords]
+  );
+  useEffect(() => {
+    if (!isStorageReady) return;
+    scheduleParkingReminders(new Set(reimbursementEntryDatesKey ? reimbursementEntryDatesKey.split(",") : []));
+  }, [isStorageReady, reimbursementEntryDatesKey]);
+
+  useEffect(() => {
+    if (!isStorageReady) return;
+    scheduleBackupReminders(lastBackupDate);
+  }, [isStorageReady, lastBackupDate]);
+
+  // Tapping a reminder opens the right screen (after login / unlock if needed).
+  useEffect(() => listenForReminderTaps((target) => setPendingReminderScreen(target)), []);
+  useEffect(() => {
+    if (!pendingReminderScreen || !isLoggedIn || isSessionLocked) return;
+    if (pendingReminderScreen === "addReimbursement") {
+      openAddReimbursement();
+    } else if (pendingReminderScreen === "backupRestore") {
+      setScreen("backupRestore");
+    } else {
+      setScreen("dashboard");
+    }
+    setPendingReminderScreen(null);
+  }, [pendingReminderScreen, isLoggedIn, isSessionLocked]);
+
+  const claimReceivedClaim = claimReceived
+    ? reimbursementClaims.find((item) => item.id === claimReceived.claimId) || {}
+    : {};
+  const claimReceivedModal = claimReceived ? (
+    <Modal transparent visible animationType="fade" statusBarTranslucent onRequestClose={() => setClaimReceived(null)}>
+      <View style={styles.appPopupOverlay}>
+        <View style={styles.appPopupCard}>
+          <Text style={styles.appPopupTitle}>Payment Received</Text>
+          <Text style={styles.appPopupMessage}>{claimReceivedClaim.claimNo} • {formatAED(claimReceivedClaim.totalAmount)}</Text>
+          <View style={{ alignSelf: "stretch" }}>
+            <DatePickerField
+              label="Date received"
+              value={claimReceived.date}
+              onChange={(date) => setClaimReceived({ ...claimReceived, date })}
+              placeholder="Select date"
+            />
+          </View>
+          <View style={styles.appPopupButtonRow}>
+            <Pressable style={[styles.appPopupButton, styles.appPopupButtonLight]} onPress={() => setClaimReceived(null)}>
+              <Text style={[styles.appPopupButtonText, styles.appPopupButtonTextLight]}>Cancel</Text>
+            </Pressable>
+            <Pressable style={[styles.appPopupButton, styles.appPopupButtonPrimary]} onPress={confirmClaimReceived}>
+              <Text style={[styles.appPopupButtonText, styles.appPopupButtonTextPrimary]}>Save</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  ) : null;
+
+  const lateClockOutModal = lateClockOut ? (
+    <Modal transparent visible animationType="fade" statusBarTranslucent onRequestClose={() => setLateClockOut(null)}>
+      <KeyboardAvoidingView style={styles.appPopupOverlay} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+        <View style={styles.appPopupCard}>
+          <Text style={styles.appPopupTitle}>Late Clock Out</Text>
+          <Text style={styles.appPopupMessage}>
+            Clock out at {formatDisplayTime(lateClockOut.time)} • In at {formatDisplayTime(todayAttendance.checkIn)}{"\n"}
+            Worked {calculateWorkedTime(todayAttendance.checkIn, lateClockOut.time)} • Extra {calculateExtraTime(todayAttendance.checkIn, lateClockOut.time, todayAttendance.normalDutyHours)}
+          </Text>
+          <Text style={styles.lateNoteLabel}>Note (optional): what kept you late?</Text>
+          <TextInput
+            style={styles.lateNoteInput}
+            value={lateClockOut.note}
+            onChangeText={(text) => setLateClockOut({ ...lateClockOut, note: text })}
+            placeholder="Example: Abu Dhabi - Gyu Kaku POS issue"
+            placeholderTextColor="#8BA2A8"
+            multiline
+          />
+          <View style={styles.appPopupButtonRow}>
+            <Pressable style={[styles.appPopupButton, styles.appPopupButtonLight]} onPress={() => setLateClockOut(null)}>
+              <Text style={[styles.appPopupButtonText, styles.appPopupButtonTextLight]}>Cancel</Text>
+            </Pressable>
+            <Pressable style={[styles.appPopupButton, styles.appPopupButtonPrimary]} onPress={() => completeClockOut(lateClockOut.time, lateClockOut.note)}>
+              <Text style={[styles.appPopupButtonText, styles.appPopupButtonTextPrimary]}>Save Clock Out</Text>
+            </Pressable>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  ) : null;
+
+  const monthlySummary = useMemo(() => {
+    const now = new Date();
+    const range = getMonthDateRange(now.getFullYear(), now.getMonth());
+    const inMonth = (record) => isDateInRange(record.date, range.from, range.to);
+    const extraMinutes = attendanceRecords
+      .filter((record) => inMonth(record) && record.checkIn && record.checkOut)
+      .reduce((sum, record) => sum + calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours || "9"), 0);
+    const pettySpent = pettyCashExpenses
+      .filter(inMonth)
+      .reduce((sum, expense) => sum + toNumber(expense.totalAmount), 0);
+    const notSubmitted = reimbursementRecords
+      .filter((record) => !record.claimId && (record.status || "Pending") === "Pending")
+      .reduce((sum, record) => sum + toNumber(record.amount), 0);
+    const waiting = reimbursementClaims
+      .filter((claim) => claim.status !== "Reimbursed")
+      .reduce((sum, claim) => sum + toNumber(claim.totalAmount), 0);
+    return {
+      title: getMonthTitle(now.getFullYear(), now.getMonth()),
+      extraMinutes,
+      pettySpent: roundMoney(pettySpent),
+      reimbursementDue: roundMoney(notSubmitted + waiting),
+    };
+  }, [attendanceRecords, pettyCashExpenses, reimbursementRecords, reimbursementClaims, minuteTick]);
+
+  const showLateClockOutBanner = Boolean(
+    todayAttendance.checkIn
+      && !todayAttendance.checkOut
+      && (isLateClockOutTime(getCurrentTime24()) || todayAttendance.date < getTodayKey())
+  ) && minuteTick >= 0;
+
+  // Day roll-over while the app stays open: switch to the new day (a late shift stays until 6 AM).
+  useEffect(() => {
+    if (!isStorageReady) return;
+    const active = pickActiveAttendance(attendanceRecords, todayAttendance);
+    if (active.date !== todayAttendance.date) setTodayAttendance(active);
+  }, [isStorageReady, minuteTick]);
+
+  // A clock-out forgotten on an earlier day (last 7 days): the dashboard asks for the time.
+  const missedClockOutRecord = findMissedClockOut(attendanceRecords, todayAttendance.date);
+
+  function openMissedClockOut() {
+    if (!missedClockOutRecord) return;
+    setMissedClockOut({ date: missedClockOutRecord.date, time: "", note: "" });
+  }
+
+  function saveMissedClockOut() {
+    if (!missedClockOut) return;
+    if (!missedClockOut.time) {
+      showAppAlert("Missing Time", "Please select the time you finished work.");
+      return;
+    }
+    const record = attendanceRecords.find((item) => item.date === missedClockOut.date);
+    if (!record) {
+      setMissedClockOut(null);
+      return;
+    }
+    const cleanNote = String(missedClockOut.note || "").trim();
+    const existingNote = String(record.note || "").trim();
+    upsertAttendanceRecord({
+      ...record,
+      checkOut: missedClockOut.time,
+      status: "Completed",
+      note: cleanNote ? (existingNote ? `${existingNote}\n${cleanNote}` : cleanNote) : record.note,
+    });
+    setMissedClockOut(null);
+    showAppAlert(
+      "Clock Out Saved",
+      `${formatDateForDisplay(record.date)}: worked ${calculateWorkedTime(record.checkIn, missedClockOut.time)} • Extra ${calculateExtraTime(record.checkIn, missedClockOut.time, record.normalDutyHours || "9")}`
+    );
+  }
+
+  const missedClockOutBanner = missedClockOutRecord ? (
+    <View style={styles.lateBanner}>
+      <Text style={styles.lateBannerTitle}>No clock-out on {formatDateForDisplay(missedClockOutRecord.date)}</Text>
+      <Text style={styles.lateBannerText}>Clocked in at {formatDisplayTime(missedClockOutRecord.checkIn)}. Add the time you finished so the extra time is counted.</Text>
+      <Pressable style={[styles.editMiniButton, { marginTop: 8, alignSelf: "flex-start" }]} onPress={openMissedClockOut}>
+        <Text style={styles.editMiniButtonText}>Add Clock-Out Time</Text>
+      </Pressable>
+    </View>
+  ) : null;
+
+  const missedClockOutModal = missedClockOut ? (
+    <Modal transparent visible animationType="fade" statusBarTranslucent onRequestClose={() => setMissedClockOut(null)}>
+      <KeyboardAvoidingView style={styles.appPopupOverlay} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+        <View style={styles.appPopupCard}>
+          <Text style={styles.appPopupTitle}>Clock Out for {formatDateForDisplay(missedClockOut.date)}</Text>
+          <Text style={styles.appPopupMessage}>If you finished after midnight, pick that time (for example 00:30). It is counted on {formatDateForDisplay(missedClockOut.date)}.</Text>
+          <View style={{ alignSelf: "stretch" }}>
+            <TimePickerField
+              label="Finished at"
+              value={missedClockOut.time}
+              onChange={(time) => setMissedClockOut({ ...missedClockOut, time })}
+              placeholder="Select time"
+            />
+          </View>
+          <Text style={styles.lateNoteLabel}>Note (optional)</Text>
+          <TextInput
+            style={styles.lateNoteInput}
+            value={missedClockOut.note}
+            onChangeText={(text) => setMissedClockOut({ ...missedClockOut, note: text })}
+            placeholder="Example: Abu Dhabi - Gyu Kaku POS issue"
+            placeholderTextColor="#8BA2A8"
+            multiline
+          />
+          <View style={styles.appPopupButtonRow}>
+            <Pressable style={[styles.appPopupButton, styles.appPopupButtonLight]} onPress={() => setMissedClockOut(null)}>
+              <Text style={[styles.appPopupButtonText, styles.appPopupButtonTextLight]}>Cancel</Text>
+            </Pressable>
+            <Pressable style={[styles.appPopupButton, styles.appPopupButtonPrimary]} onPress={saveMissedClockOut}>
+              <Text style={[styles.appPopupButtonText, styles.appPopupButtonTextPrimary]}>Save</Text>
+            </Pressable>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  ) : null;
+
   useEffect(() => {
     Animated.loop(
       Animated.sequence([
@@ -1639,6 +1908,8 @@ export default function App() {
     bcBranchData,
     reimbursementRecords,
     reimbursementClaims,
+    pettySubmissions,
+    lastBackupDate,
     biometricEnabled,
   ]);
 
@@ -1719,15 +1990,7 @@ export default function App() {
       const loadedAttendanceRecords = Array.isArray(savedData.attendanceRecords)
         ? savedData.attendanceRecords
         : [];
-      const todayKey = getTodayKey();
-      const savedTodayRecord = loadedAttendanceRecords.find((record) => record.date === todayKey);
-
-      let loadedTodayAttendance = { ...emptyAttendance, date: todayKey };
-      if (savedData.todayAttendance?.date === todayKey) {
-        loadedTodayAttendance = { ...emptyAttendance, ...savedData.todayAttendance, date: todayKey };
-      } else if (savedTodayRecord) {
-        loadedTodayAttendance = { ...emptyAttendance, ...savedTodayRecord, date: todayKey };
-      }
+      const loadedTodayAttendance = pickActiveAttendance(loadedAttendanceRecords, savedData.todayAttendance);
 
       setProfileData(loadedProfile);
       setScreen("login");
@@ -1755,6 +2018,8 @@ export default function App() {
       setReimbursementClaims(
         Array.isArray(savedData.reimbursementClaims) ? savedData.reimbursementClaims : []
       );
+      setPettySubmissions(Array.isArray(savedData.pettySubmissions) ? savedData.pettySubmissions : []);
+      setLastBackupDate(typeof savedData.lastBackupDate === "string" ? savedData.lastBackupDate : "");
       setBiometricEnabled(savedData.biometricEnabled === true);
 
       const loadedCompanyBranches = isValidCompanyBranches(savedData.companyBranchesData)
@@ -1786,6 +2051,8 @@ export default function App() {
       bcBranchData,
       reimbursementRecords,
       reimbursementClaims,
+      pettySubmissions,
+      lastBackupDate,
       biometricEnabled,
       savedAt: new Date().toISOString(),
     };
@@ -1856,6 +2123,7 @@ export default function App() {
     setReimbursementClaims(
       Array.isArray(data.reimbursementClaims) ? data.reimbursementClaims : []
     );
+    setPettySubmissions(Array.isArray(data.pettySubmissions) ? data.pettySubmissions : []);
     setBiometricEnabled(data.biometricEnabled === true);
 
     const firstCompany = Object.keys(mergedCompanyBranches)[0] || "QSR";
@@ -1864,7 +2132,7 @@ export default function App() {
 
   async function exportBackupJson() {
     try {
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
 
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Backup sharing is not available on this device.");
@@ -1893,6 +2161,7 @@ export default function App() {
         dialogTitle: "Share DailyTask Backup",
         UTI: "public.json",
       });
+      setLastBackupDate(getTodayKey());
     } catch (error) {
       console.log("Backup export error:", error);
       showAppAlert("Backup Failed", "Could not create backup file. Send me the error screenshot if it repeats.");
@@ -2029,7 +2298,6 @@ export default function App() {
     if (screen === "changePassword") return setScreen("profile");
     if (screen === "attendance") return setScreen("dashboard");
     if (screen === "attendanceHistory") return setScreen("attendance");
-    if (screen === "attendanceDrilldown") return setScreen("attendance");
     if (screen === "editAttendance") return setScreen("attendance");
     if (screen === "tasks") return setScreen("dashboard");
     if (screen === "completedTasks") return setScreen("tasks");
@@ -2399,32 +2667,6 @@ export default function App() {
     setScreen("profile");
   }
 
-  function resetPasswordToDefault() {
-    showAppAlert(
-      "Reset Password",
-      "This will reset the login password on this phone to admin123. Your saved app data will not be deleted.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Reset",
-          style: "destructive",
-          onPress: () => {
-            const updatedProfile = {
-              ...profileData,
-              username: profileData.username || demoUser.username,
-              password: demoUser.password,
-            };
-            setProfileData(updatedProfile);
-            setCurrentUser(updatedProfile);
-            setPassword("");
-            setChangePasswordForm({ currentPassword: "", newPassword: "", confirmPassword: "" });
-            showAppAlert("Password Reset", "Login password is now admin123.");
-          },
-        },
-      ]
-    );
-  }
-
   function openSignUpPage() {
     setSignupForm({
       username: "",
@@ -2482,11 +2724,6 @@ export default function App() {
       return;
     }
 
-    if (!recoveryPhoneText && !recoveryEmailText) {
-      showAppAlert("Recovery Required", "Please enter at least one recovery option: phone number or email ID.");
-      return;
-    }
-
     if (recoveryEmailText && !recoveryEmailText.includes("@")) {
       showAppAlert("Invalid Email", "Please enter a valid email ID, or leave email blank and use phone number.");
       return;
@@ -2519,41 +2756,51 @@ export default function App() {
 
   function openForgotPasswordRecovery() {
     setForgotRecoveryForm({ identifier: "", newPassword: "", confirmPassword: "" });
+    setForgotVerified(false);
     setScreen("forgotPassword");
   }
 
-  function recoveryIdentifierMatchesProfile(identifier) {
-    const value = String(identifier || "").trim();
-    if (!value) return false;
-
-    const savedEmail = String(profileData.email || "").trim().toLowerCase();
-    const savedPhone = normalizePhoneNumber(profileData.phone || "");
-    const enteredEmail = value.toLowerCase();
-    const enteredPhone = normalizePhoneNumber(value);
-
-    return Boolean(
-      (savedEmail && enteredEmail === savedEmail) ||
-      (savedPhone && enteredPhone && enteredPhone === savedPhone)
-    );
+  // Forgot password: prove you own this phone with its fingerprint / face / PIN / pattern.
+  // Works offline and costs nothing (no SMS).
+  async function verifyForgotWithPhoneLock() {
+    if (Platform.OS === "web") {
+      // Browser preview only: there is no phone lock to check.
+      setForgotVerified(true);
+      showAppAlert("Preview", "On the phone this step asks for your fingerprint or phone PIN. In the preview it is skipped.");
+      return;
+    }
+    try {
+      const level = await LocalAuthentication.getEnrolledLevelAsync();
+      if (level === LocalAuthentication.SecurityLevel.NONE) {
+        showAppAlert(
+          "No Phone Lock",
+          "This phone has no fingerprint, PIN or pattern set. Set a screen lock in Android Settings > Security, then try again. Otherwise use Reset App below."
+        );
+        return;
+      }
+      const result = await LocalAuthentication.authenticateAsync({
+        promptMessage: "Verify it's you to reset the DailyTask password",
+        cancelLabel: "Cancel",
+        disableDeviceFallback: false,
+      });
+      if (result.success) {
+        setForgotVerified(true);
+        return;
+      }
+      if (result.error === "user_cancel" || result.error === "system_cancel" || result.error === "app_cancel") return;
+      showAppAlert("Not Verified", "Phone lock check did not pass. Try again, or use Reset App below.");
+    } catch (error) {
+      console.log("Forgot password phone lock error:", error);
+      showAppAlert("Not Verified", "Phone lock check is not available. Use Reset App below.");
+    }
   }
 
   function saveRecoveredPassword() {
-    const identifier = forgotRecoveryForm.identifier.trim();
     const newPasswordText = forgotRecoveryForm.newPassword.trim();
     const confirmPasswordText = forgotRecoveryForm.confirmPassword.trim();
 
-    if (!identifier) {
-      showAppAlert("Missing Recovery Detail", "Enter your registered phone number or email ID.");
-      return;
-    }
-
-    if (!profileData.email && !profileData.phone) {
-      showAppAlert("Recovery Not Set", "No phone number or email ID is saved in this profile. Login once and update Profile, or clear app data if this is your own phone.");
-      return;
-    }
-
-    if (!recoveryIdentifierMatchesProfile(identifier)) {
-      showAppAlert("Verification Failed", "The phone number or email ID does not match the saved profile on this phone.");
+    if (!forgotVerified) {
+      showAppAlert("Verify First", "Tap Verify with Phone Lock first.");
       return;
     }
 
@@ -2577,8 +2824,64 @@ export default function App() {
     setUsername(updatedProfile.username || demoUser.username);
     setPassword("");
     setForgotRecoveryForm({ identifier: "", newPassword: "", confirmPassword: "" });
-    showAppAlert("Password Updated", `Your local login password has been updated. Login with username: ${updatedProfile.username || demoUser.username}`);
+    setForgotVerified(false);
+    showAppAlert("Password Updated", `Your password has been updated. Login with username: ${updatedProfile.username || demoUser.username}`);
     setScreen("login");
+  }
+
+  // Last resort: delete all DailyTask data on this phone, then sign up again and restore a backup.
+  function resetAppData() {
+    showAppAlert(
+      "Reset App?",
+      "This deletes ALL DailyTask data on this phone: attendance, tasks, petty cash, reimbursement and your login. It cannot be undone. Restore your backup file afterwards.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Continue",
+          style: "destructive",
+          onPress: () => showAppAlert(
+            "Delete Everything?",
+            "Last check: have you got a backup file (for example in Google Drive)? Without it the data is gone.",
+            [
+              { text: "Cancel", style: "cancel" },
+              { text: "Delete All Data", style: "destructive", onPress: () => { performAppReset(); } },
+            ]
+          ),
+        },
+      ]
+    );
+  }
+
+  async function performAppReset() {
+    try {
+      await AsyncStorage.removeItem(STORAGE_KEY);
+    } catch (error) {
+      console.log("Reset storage error:", error);
+    }
+    cancelAllReminders();
+    setProfileData(demoUser);
+    setCurrentUser(null);
+    setUsername("");
+    setPassword("");
+    setTodayAttendance({ ...emptyAttendance, date: getTodayKey() });
+    setAttendanceRecords([]);
+    setTasks([]);
+    setCashReceivedRecords([]);
+    setPettyCashExpenses([]);
+    setCashTransfers([]);
+    setPettyClosings([]);
+    setReimbursementRecords([]);
+    setReimbursementClaims([]);
+    setPettySubmissions([]);
+    setLastBackupDate("");
+    setBiometricEnabled(false);
+    setCompanyBranchesData(DEFAULT_COMPANY_BRANCHES);
+    setSupplierData(DEFAULT_SUPPLIERS);
+    setBcBranchData(DEFAULT_BC_BRANCH_CODES);
+    setForgotVerified(false);
+    setForgotRecoveryForm({ identifier: "", newPassword: "", confirmPassword: "" });
+    openSignUpPage();
+    showAppAlert("App Reset", "All data was deleted. Create your account, then go to Settings / Backup > Import / Restore Backup to bring your data back.");
   }
 
   function upsertAttendanceRecord(record) {
@@ -2592,46 +2895,79 @@ export default function App() {
     });
   }
 
+  // The day the buttons act on. Normally today; until 6 AM it can still be yesterday's open shift.
+  function getActiveAttendance() {
+    const active = pickActiveAttendance(attendanceRecords, todayAttendance);
+    if (active.date !== todayAttendance.date) setTodayAttendance(active);
+    return active;
+  }
+
   function handleClockIn() {
-    if (todayAttendance.checkIn) {
-      showAppAlert("Already Clocked In", "You already clocked in today.");
+    const active = getActiveAttendance();
+    if (active.checkIn) {
+      showAppAlert(
+        "Already Clocked In",
+        active.date === getTodayKey()
+          ? "You already clocked in today."
+          : `You are still clocked in from ${formatDateForDisplay(active.date)}. Clock out first.`
+      );
       return;
     }
     const blockedTypes = getNonWorkingAttendanceTypes();
-    if (blockedTypes.includes(todayAttendance.dayType)) {
+    if (blockedTypes.includes(active.dayType)) {
       showAppAlert("Not Work Day", "Change day type to Work Day, Off Cancelled, or PH Worked first.");
       return;
     }
     const nowTime = getCurrentTime24();
     const updatedRecord = {
-      ...todayAttendance,
+      ...active,
       date: getTodayKey(),
       checkIn: nowTime,
       status: "Clocked In",
-      dayType: todayAttendance.dayType || "Work Day",
+      dayType: active.dayType || "Work Day",
     };
     setTodayAttendance(updatedRecord);
     upsertAttendanceRecord(updatedRecord);
   }
 
   function handleClockOut() {
-    if (!todayAttendance.checkIn) {
+    const active = getActiveAttendance();
+    if (!active.checkIn) {
       showAppAlert("Clock In Required", "Please clock in first.");
       return;
     }
-    if (todayAttendance.checkOut) {
+    if (active.checkOut) {
       showAppAlert("Already Clocked Out", "You already clocked out today.");
       return;
     }
     const nowTime = getCurrentTime24();
+    // After 7 PM, or after midnight on a shift that started yesterday: ask for a note (optional).
+    if (isLateClockOutTime(nowTime) || active.date < getTodayKey()) {
+      setLateClockOut({ time: nowTime, note: "" });
+      return;
+    }
+    completeClockOut(nowTime, "");
+  }
+
+  function completeClockOut(clockOutTime, lateNote) {
+    const active = pickActiveAttendance(attendanceRecords, todayAttendance);
+    const cleanNote = String(lateNote || "").trim();
+    const existingNote = String(active.note || "").trim();
     const updatedRecord = {
-      ...todayAttendance,
-      date: getTodayKey(),
-      checkOut: nowTime,
+      ...active,
+      checkOut: clockOutTime,
       status: "Completed",
+      note: cleanNote ? (existingNote ? `${existingNote}\n${cleanNote}` : cleanNote) : active.note,
     };
     setTodayAttendance(updatedRecord);
     upsertAttendanceRecord(updatedRecord);
+    setLateClockOut(null);
+    cancelLateClockOutReminders();
+
+    const extraMinutes = calculateExtraMinutes(updatedRecord.checkIn, clockOutTime, updatedRecord.normalDutyHours);
+    if (extraMinutes > 0) {
+      showAppAlert("Clocked Out", `Worked ${calculateWorkedTime(updatedRecord.checkIn, clockOutTime)} • Extra ${minutesToReadable(extraMinutes)}${cleanNote ? "\nNote saved." : ""}`);
+    }
   }
 
   function setAttendanceDayType(type) {
@@ -2716,13 +3052,15 @@ export default function App() {
     setAttendanceMonth({ year: nextDate.getFullYear(), monthIndex: nextDate.getMonth() });
   }
 
-  function openAttendanceDrilldown(type, title, subtitle = "") {
-    setAttendanceDrilldown({ type, title, subtitle });
-    setScreen("attendanceDrilldown");
-  }
-
   async function writeWorkbookAndShare(workbook, baseFileName, dialogTitle) {
     const fileName = `${sanitizeExportFileName(baseFileName)}.xlsx`;
+
+    if (Platform.OS === "web") {
+      // Browser preview only: download the file instead of the phone share sheet.
+      XLSX.writeFile(workbook, fileName);
+      return;
+    }
+
     const folderUri = FileSystem.cacheDirectory || FileSystem.documentDirectory;
     const fileUri = `${folderUri}${fileName}`;
     const workbookBase64 = XLSX.write(workbook, { type: "base64", bookType: "xlsx" });
@@ -2745,7 +3083,7 @@ export default function App() {
 
   async function exportAttendanceTimesheetExcel() {
     try {
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Sharing is not available on this device.");
         return;
@@ -3017,19 +3355,43 @@ export default function App() {
     setScreen("addCashTransfer");
   }
 
+  // Adds the closing flags to a petty cash record and tells the user when a missed
+  // (back-dated) entry is counted in the current open period.
+  function withPettyPeriodFlags(record, existingRecord) {
+    const flags = getPettyPeriodFlags(existingRecord, record.date, pettyClosings);
+    const nextRecord = { ...record };
+    delete nextRecord.periodClosingId;
+    delete nextRecord.lateEntry;
+    if (flags.periodClosingId) nextRecord.periodClosingId = flags.periodClosingId;
+    if (flags.lateEntry) nextRecord.lateEntry = true;
+
+    const latestClosing = getLatestPettyClosing(pettyClosings);
+    if (!existingRecord && flags.lateEntry && latestClosing) {
+      setTimeout(() => showAppAlert(
+        "Added to Current Period",
+        `This date is before the last Month Closing (${formatDateForDisplay(latestClosing.date)}). ` +
+          "The entry keeps its date for reports and BC export, and it is counted in the current open period balance."
+      ), 200);
+    }
+    return nextRecord;
+  }
+
   function addCashReceived() {
     const amount = toNumber(newCashReceived.amount);
     if (!amount || amount <= 0) {
       showAppAlert("Missing Amount", "Please enter received amount.");
       return;
     }
-    const record = {
+    const existingRecord = editingCashReceivedId
+      ? cashReceivedRecords.find((item) => item.id === editingCashReceivedId)
+      : null;
+    const record = withPettyPeriodFlags({
       id: editingCashReceivedId || Date.now(),
       date: newCashReceived.date || getTodayKey(),
       amount,
       receivedFrom: newCashReceived.receivedFrom.trim() || "Office",
       notes: newCashReceived.notes.trim(),
-    };
+    }, existingRecord);
     if (editingCashReceivedId) {
       setCashReceivedRecords(cashReceivedRecords.map((item) => (item.id === editingCashReceivedId ? record : item)));
     } else {
@@ -3059,7 +3421,10 @@ export default function App() {
       showAppAlert("Missing Amount", "Please enter transfer amount.");
       return;
     }
-    const transfer = {
+    const existingTransfer = editingTransferId
+      ? cashTransfers.find((item) => item.id === editingTransferId)
+      : null;
+    const transfer = withPettyPeriodFlags({
       id: editingTransferId || Date.now(),
       date: newTransfer.date || getTodayKey(),
       transferType: newTransfer.transferType,
@@ -3067,7 +3432,7 @@ export default function App() {
       amount,
       purpose: newTransfer.purpose.trim(),
       notes: newTransfer.notes.trim(),
-    };
+    }, existingTransfer);
     if (editingTransferId) {
       setCashTransfers(cashTransfers.map((item) => (item.id === editingTransferId ? transfer : item)));
     } else {
@@ -3129,32 +3494,112 @@ export default function App() {
       createdAt: new Date().toISOString(),
     };
 
-    const nextClosings = [closingRecord, ...pettyClosings];
-
-    if (settlementAmount > 0) {
-      const closingTransfer = {
-        id: closingId + 1,
-        closingId,
-        date: newMonthClosing.date,
-        transferType: "Transfer Out",
-        personName: settlementTo,
-        amount: settlementAmount,
-        purpose: "Month Closing Settlement",
-        notes: closingRecord.notes || "Petty cash month closing",
-      };
-      setCashTransfers([closingTransfer, ...cashTransfers]);
+    const latestClosing = getLatestPettyClosing(pettyClosings);
+    if (latestClosing && String(newMonthClosing.date) < String(latestClosing.date)) {
+      showAppAlert("Invalid Date", `Closing date cannot be before the last closing (${formatDateForDisplay(latestClosing.date)}).`);
+      return;
     }
 
-    setPettyClosings(nextClosings);
-    resetMonthClosingForm();
-    showAppAlert("Month Closed", "Petty cash period closed successfully. New entries after the closing date will show in the next open period.");
-    setScreen("pettyCash");
+    const doClose = () => {
+      const nextClosings = [closingRecord, ...pettyClosings];
+      // Everything in the open period now belongs to this closing.
+      const stamp = (record) => (isPettyRecordOpen(record, latestClosing)
+        ? { ...record, periodClosingId: closingId }
+        : record);
+
+      let nextTransfers = cashTransfers.map(stamp);
+      if (settlementAmount > 0) {
+        const closingTransfer = {
+          id: closingId + 1,
+          closingId,
+          periodClosingId: closingId,
+          date: newMonthClosing.date,
+          transferType: "Transfer Out",
+          personName: settlementTo,
+          amount: settlementAmount,
+          purpose: "Month Closing Settlement",
+          notes: closingRecord.notes || "Petty cash month closing",
+        };
+        nextTransfers = [closingTransfer, ...nextTransfers];
+      }
+
+      setCashReceivedRecords(cashReceivedRecords.map(stamp));
+      setPettyCashExpenses(pettyCashExpenses.map(stamp));
+      setCashTransfers(nextTransfers);
+      setPettyClosings(nextClosings);
+      resetMonthClosingForm();
+      showAppAlert("Month Closed", "Petty cash period closed. New entries, and any missed bill you add later, will count in the next open period.");
+      setScreen("pettyCash");
+    };
+
+    const cashWithOthers = roundMoney(pettyTotals.cashInTransfer);
+    if (Math.abs(cashWithOthers) > 0.01) {
+      showAppAlert(
+        "Cash Still With Others",
+        `${formatAED(cashWithOthers)} is still out on transfer (given and not returned). ` +
+          "After closing it is no longer shown in the balance. Close anyway?",
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Close Anyway", style: "destructive", onPress: doClose },
+        ]
+      );
+      return;
+    }
+
+    doClose();
+  }
+
+  // Petty cash monthly submission marker (calendar month). Only records submitted / not submitted.
+  function getPettySubmissionMonths() {
+    const today = new Date();
+    return [-1, 0].map((offset) => {
+      const date = new Date(today.getFullYear(), today.getMonth() + offset, 1);
+      return {
+        key: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`,
+        title: getMonthTitle(date.getFullYear(), date.getMonth()),
+      };
+    });
+  }
+
+  function markPettySubmitted(month) {
+    showAppAlert("Mark Submitted", `Mark ${month.title} petty cash as submitted today (${formatDateForDisplay(getTodayKey())})?`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Mark Submitted",
+        onPress: () => setPettySubmissions([
+          { id: Date.now(), month: month.key, submittedDate: getTodayKey() },
+          ...pettySubmissions.filter((item) => item.month !== month.key),
+        ]),
+      },
+    ]);
+  }
+
+  function undoPettySubmission(month) {
+    showAppAlert("Undo Submission", `Set ${month.title} petty cash back to Not submitted?`, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Undo", onPress: () => setPettySubmissions(pettySubmissions.filter((item) => item.month !== month.key)) },
+    ]);
   }
 
   function deletePettyMonthClosing(closingId) {
+    const latestClosing = getLatestPettyClosing(pettyClosings);
+    if (latestClosing && latestClosing.id !== closingId) {
+      showAppAlert("Delete Latest First", "Only the latest Month Closing can be deleted. Delete the newer closings first.");
+      return;
+    }
+
+    // Undo: entries taken by this closing go back to the open period.
+    const reopen = (record) => {
+      if (record.periodClosingId !== closingId) return record;
+      const next = { ...record };
+      delete next.periodClosingId;
+      next.lateEntry = true;
+      return next;
+    };
+
     showAppAlert(
       "Delete Month Closing",
-      "Delete this month closing? The linked settlement transfer will also be removed.",
+      "Delete this month closing? The linked settlement transfer will also be removed and its entries go back to the open period.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -3162,7 +3607,9 @@ export default function App() {
           style: "destructive",
           onPress: () => {
             setPettyClosings(pettyClosings.filter((item) => item.id !== closingId));
-            setCashTransfers(cashTransfers.filter((transfer) => transfer.closingId !== closingId));
+            setCashTransfers(cashTransfers.filter((transfer) => transfer.closingId !== closingId).map(reopen));
+            setCashReceivedRecords(cashReceivedRecords.map(reopen));
+            setPettyCashExpenses(pettyCashExpenses.map(reopen));
           },
         },
       ]
@@ -3517,7 +3964,10 @@ export default function App() {
     if (!newExpense.itemDescription.trim()) return showAppAlert("Missing Item", "Please enter item description.");
     if (!amounts.totalAmount || amounts.totalAmount <= 0) return showAppAlert("Missing Amount", "Please enter invoice amount.");
 
-    const expense = {
+    const existingExpense = editingExpenseId
+      ? pettyCashExpenses.find((item) => item.id === editingExpenseId)
+      : null;
+    const expense = withPettyPeriodFlags({
       id: editingExpenseId || Date.now(),
       date: newExpense.date || getTodayKey(),
       supplier: newExpense.supplier.trim(),
@@ -3533,7 +3983,7 @@ export default function App() {
       invoiceNumber: newExpense.invoiceNumber.trim(),
       paidBy: newExpense.paidBy.trim(),
       notes: newExpense.notes.trim(),
-    };
+    }, existingExpense);
 
     if (editingExpenseId) {
       setPettyCashExpenses(pettyCashExpenses.map((item) => (item.id === editingExpenseId ? expense : item)));
@@ -3563,7 +4013,7 @@ export default function App() {
 
   async function exportPettyCashExcel() {
     try {
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Sharing is not available on this device.");
         return;
@@ -3685,7 +4135,7 @@ export default function App() {
 
   async function exportPettyCashBcExcel() {
     try {
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Sharing is not available on this device.");
         return;
@@ -3719,11 +4169,12 @@ export default function App() {
   }
 
   function resetReimbursementClaimForm() {
-    const fallbackRange = getDefaultClaimDateRange();
+    // Next claim starts the day after the last submitted claim (default cycle 24th to 23rd).
+    const nextRange = getNextClaimRange(reimbursementClaims);
     setNewReimbursementClaim({
       ...emptyReimbursementClaim,
-      fromDate: reimbursementReportFromDate || fallbackRange.from,
-      toDate: reimbursementReportToDate || fallbackRange.to,
+      fromDate: nextRange.from,
+      toDate: nextRange.to,
       submitDate: getTodayKey(),
       submittedTo: "Rahim",
     });
@@ -3906,36 +4357,57 @@ export default function App() {
     setScreen("reimbursement");
   }
 
+  // "Payment Received": asks for the date the money came, then marks the claim and its records.
   function markReimbursementClaimReimbursed(claimId) {
     const claim = reimbursementClaims.find((item) => item.id === claimId);
     if (!claim) return;
+    setClaimReceived({ claimId, date: getTodayKey() });
+  }
 
-    showAppAlert(
-      "Mark Reimbursed",
-      `Mark ${claim.claimNo} as reimbursed?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Mark Reimbursed",
-          onPress: () => {
-            setReimbursementClaims(
-              reimbursementClaims.map((item) => (
-                item.id === claimId
-                  ? { ...item, status: "Reimbursed", reimbursedDate: getTodayKey() }
-                  : item
-              ))
-            );
-            setReimbursementRecords(
-              reimbursementRecords.map((record) => (
-                record.claimId === claimId
-                  ? { ...record, status: "Reimbursed" }
-                  : record
-              ))
-            );
-          },
-        },
-      ]
+  function confirmClaimReceived() {
+    if (!claimReceived) return;
+    const { claimId, date } = claimReceived;
+    if (!date) {
+      showAppAlert("Missing Date", "Please select the date the payment was received.");
+      return;
+    }
+    setReimbursementClaims(
+      reimbursementClaims.map((item) => (
+        item.id === claimId ? { ...item, status: "Reimbursed", reimbursedDate: date } : item
+      ))
     );
+    setReimbursementRecords(
+      reimbursementRecords.map((record) => (
+        record.claimId === claimId ? { ...record, status: "Reimbursed" } : record
+      ))
+    );
+    setClaimReceived(null);
+  }
+
+  function undoClaimReceived(claimId) {
+    const claim = reimbursementClaims.find((item) => item.id === claimId);
+    if (!claim) return;
+    showAppAlert("Not Received Yet?", `Set ${claim.claimNo} back to waiting for payment?`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Set Waiting",
+        onPress: () => {
+          setReimbursementClaims(
+            reimbursementClaims.map((item) => {
+              if (item.id !== claimId) return item;
+              const next = { ...item, status: "Submitted" };
+              delete next.reimbursedDate;
+              return next;
+            })
+          );
+          setReimbursementRecords(
+            reimbursementRecords.map((record) => (
+              record.claimId === claimId ? { ...record, status: "Submitted" } : record
+            ))
+          );
+        },
+      },
+    ]);
   }
 
   function deleteReimbursementClaim(claimId) {
@@ -3989,7 +4461,7 @@ export default function App() {
 
   async function exportReimbursementExcel() {
     try {
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Sharing is not available on this device.");
         return;
@@ -4073,7 +4545,7 @@ export default function App() {
 
   async function exportReimbursementBcExcel() {
     try {
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Sharing is not available on this device.");
         return;
@@ -4106,7 +4578,7 @@ export default function App() {
         return;
       }
 
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Sharing is not available on this device.");
         return;
@@ -4199,7 +4671,7 @@ export default function App() {
         return;
       }
 
-      const sharingAvailable = await Sharing.isAvailableAsync();
+      const sharingAvailable = await isExportAvailable();
       if (!sharingAvailable) {
         showAppAlert("Sharing Not Available", "Sharing is not available on this device.");
         return;
@@ -4514,7 +4986,7 @@ export default function App() {
               <Text style={styles.loginTopMini}>New User Setup</Text>
               <Text style={styles.loginHeroTitle}>Create Account</Text>
               <Text style={styles.loginHeroSub}>
-                Create your own local username and password. Recovery phone or email is required for forgot password.
+                Create your own local username and password. If you forget it, reset it with your phone's fingerprint or PIN.
               </Text>
             </Animated.View>
 
@@ -4589,7 +5061,7 @@ export default function App() {
               />
 
               <Text style={styles.loginHelperText}>
-                Phone or email is mandatory. You can enter both for safer recovery.
+                Phone and email are optional (saved in your profile).
               </Text>
 
               <Pressable style={styles.modernLoginButton} onPress={createLocalAccount}>
@@ -4598,6 +5070,99 @@ export default function App() {
 
               <Pressable style={styles.forgotPasswordButton} onPress={() => setScreen("login")}>
                 <Text style={styles.forgotPasswordText}>Back to Login</Text>
+              </Pressable>
+            </Animated.View>
+
+            <View style={styles.loginPoweredBadgeInline}>
+              <Text style={styles.poweredBadgeSmall}>Powered by</Text>
+              <Text style={styles.poweredBadgeName}>Crescent IT Solution</Text>
+            </View>
+          </ScrollView>
+        </KeyboardAvoidingView>
+        <AppAlertHost />
+      </SafeAreaView>
+    );
+  }
+
+
+  if (!isLoggedIn && screen === "forgotPassword") {
+    return (
+      <SafeAreaView style={styles.darkSafeArea}>
+        <StatusBar barStyle="light-content" backgroundColor="#0E3B43" />
+        <KeyboardAvoidingView
+          style={styles.modernLoginScreen}
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+        >
+          <Animated.View style={[styles.loginBlobOne, { opacity: 0.9 }]} />
+          <Animated.View style={[styles.loginBlobTwo, { opacity: 0.9 }]} />
+
+          <Pressable style={styles.modernBackButton} onPress={() => setScreen("login")}>
+            <Text style={styles.modernBackButtonText}>‹</Text>
+          </Pressable>
+
+          <ScrollView
+            style={styles.loginScroll}
+            contentContainerStyle={styles.loginScrollContent}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            <Animated.View style={[styles.loginHeroWrap, { opacity: fadeAnim }]}>
+              <Text style={styles.loginTopMini}>Account Recovery</Text>
+              <Text style={styles.loginHeroTitle}>Reset Password</Text>
+              <Text style={styles.loginHeroSub}>
+                Prove it's your phone with your fingerprint or phone PIN / pattern, then set a new password. Your data stays.
+              </Text>
+            </Animated.View>
+
+            <Animated.View style={[styles.modernLoginCard, { opacity: fadeAnim }]}>
+              {!forgotVerified ? (
+                <>
+                  <Text style={styles.inputLabel}>Step 1: Verify it's you</Text>
+                  <Pressable style={styles.modernLoginButton} onPress={verifyForgotWithPhoneLock}>
+                    <Text style={styles.modernLoginButtonText}>Verify with Phone Lock</Text>
+                  </Pressable>
+                </>
+              ) : (
+                <>
+                  <Text style={styles.inputLabel}>Step 2: New Password</Text>
+                  <TextInput
+                    ref={forgotNewPasswordInputRef}
+                    style={styles.modernInput}
+                    placeholder="Enter new password"
+                    placeholderTextColor="#8BA2A8"
+                    value={forgotRecoveryForm.newPassword}
+                    onChangeText={(text) => setForgotRecoveryForm({ ...forgotRecoveryForm, newPassword: text })}
+                    secureTextEntry
+                    returnKeyType="next"
+                    blurOnSubmit={false}
+                    onSubmitEditing={() => forgotConfirmPasswordInputRef.current?.focus()}
+                  />
+
+                  <Text style={styles.inputLabel}>Confirm New Password</Text>
+                  <TextInput
+                    ref={forgotConfirmPasswordInputRef}
+                    style={styles.modernInput}
+                    placeholder="Re-enter new password"
+                    placeholderTextColor="#8BA2A8"
+                    value={forgotRecoveryForm.confirmPassword}
+                    onChangeText={(text) => setForgotRecoveryForm({ ...forgotRecoveryForm, confirmPassword: text })}
+                    secureTextEntry
+                    returnKeyType="done"
+                    onSubmitEditing={saveRecoveredPassword}
+                  />
+
+                  <Pressable style={styles.modernLoginButton} onPress={saveRecoveredPassword}>
+                    <Text style={styles.modernLoginButtonText}>Update Password</Text>
+                  </Pressable>
+                </>
+              )}
+              <Pressable style={styles.forgotPasswordButton} onPress={() => setScreen("login")}>
+                <Text style={styles.forgotPasswordText}>Back to Login</Text>
+              </Pressable>
+              <View style={styles.securityDivider} />
+              <Text style={styles.resetAppHint}>Can't verify? Last option: delete all data on this phone, sign up again and restore your backup.</Text>
+              <Pressable style={styles.resetAppButton} onPress={resetAppData}>
+                <Text style={styles.resetAppButtonText}>Reset App (delete all data)</Text>
               </Pressable>
             </Animated.View>
 
@@ -4895,9 +5460,6 @@ export default function App() {
           <Pressable style={styles.secondaryButton} onPress={() => setScreen("changePassword")}>
             <Text style={styles.secondaryButtonText}>Change Password</Text>
           </Pressable>
-          <Pressable style={styles.lightWarningButton} onPress={resetPasswordToDefault}>
-            <Text style={styles.lightWarningButtonText}>Reset to admin123</Text>
-          </Pressable>
           <View style={styles.securityDivider} />
           <InfoLine label="Biometric Login" value={biometricEnabled ? "Enabled" : "Disabled"} />
           <Text style={styles.helpText}>Enable fingerprint, face unlock or phone lock login for this device.</Text>
@@ -4948,13 +5510,6 @@ export default function App() {
           </Pressable>
         </View>
 
-        <View style={styles.editCard}>
-          <Text style={styles.sectionMiniTitle}>Forgot Password</Text>
-          <Text style={styles.helpText}>Use this only on your own phone. It resets only the local password and keeps all app data.</Text>
-          <Pressable style={styles.lightWarningButton} onPress={resetPasswordToDefault}>
-            <Text style={styles.lightWarningButtonText}>Reset Password to admin123</Text>
-          </Pressable>
-        </View>
       </Page>
     );
   }
@@ -4990,6 +5545,15 @@ export default function App() {
             <Pressable style={styles.clockOutButton} onPress={handleClockOut}><Text style={styles.clockOutText}>Clock Out</Text></Pressable>
           </View>
           <Text style={styles.totalWorkedText}>Total Worked: {workedTimeText} • Extra Earned: {extraTimeText}</Text>
+          {showLateClockOutBanner ? (
+            <View style={styles.lateBanner}>
+              <Text style={styles.lateBannerTitle}>It is after 7 PM. Still working?</Text>
+              <Text style={styles.lateBannerText}>Clock out when you finish. You will be asked for a short note for the extra time.</Text>
+            </View>
+          ) : null}
+          {missedClockOutBanner}
+          {lateClockOutModal}
+          {missedClockOutModal}
         </View>
 
         <View style={styles.editCard}>
@@ -5089,85 +5653,11 @@ export default function App() {
           </View>
           <Text style={styles.sectionMiniTitle}>Carry Forward Balance</Text>
           <View style={styles.summaryGrid}>
-            <SummaryCard
-              title="Pending Off"
-              value={String(carryForwardBalance.pendingClosing)}
-              subtitle="Closing balance"
-              onPress={() => openAttendanceDrilldown("Pending Off Taken", "Pending Off Taken", "Dates where pending off was used")}
-            />
-            <SummaryCard
-              title="PH Balance"
-              value={String(carryForwardBalance.phClosing)}
-              subtitle="Closing balance"
-              onPress={() => openAttendanceDrilldown("PH Comp Off Taken", "PH Comp Off Taken", "Dates where PH comp off was used")}
-            />
-            <SummaryCard
-              title="Extra Hours"
-              value={minutesToReadable(carryForwardBalance.extraClosingMinutes)}
-              subtitle="Closing balance"
-              onPress={() => openAttendanceDrilldown("Extra Earned", "Extra Hours Earned", "Dates with overtime earned")}
-            />
-            <SummaryCard
-              title="PH Off"
-              value={String(carryForwardBalance.phOffCount)}
-              subtitle="This month"
-              onPress={() => openAttendanceDrilldown("PH Off", "PH Off", "Public holiday off dates")}
-            />
+            <SummaryCard title="Pending Off" value={String(carryForwardBalance.pendingClosing)} subtitle="Closing" />
+            <SummaryCard title="PH Balance" value={String(carryForwardBalance.phClosing)} subtitle="Closing" />
+            <SummaryCard title="Extra Hours" value={minutesToReadable(carryForwardBalance.extraClosingMinutes)} subtitle="Closing" />
+            <SummaryCard title="PH Off" value={String(carryForwardBalance.phOffCount)} subtitle="This month" />
           </View>
-
-          <Text style={styles.sectionMiniTitle}>Attendance Details Breakdown</Text>
-          <Text style={styles.noteHelpText}>Tap any card to see exact dates and details for this month.</Text>
-          <View style={styles.summaryGrid}>
-            <SummaryCard
-              title="Pending Off Taken"
-              value={String(attendanceDrilldownSummary.pendingOffTaken)}
-              subtitle="View dates"
-              onPress={() => openAttendanceDrilldown("Pending Off Taken", "Pending Off Taken", "Pending off used dates")}
-            />
-            <SummaryCard
-              title="Off Cancelled"
-              value={String(attendanceDrilldownSummary.offCancelled)}
-              subtitle="Pending earned"
-              onPress={() => openAttendanceDrilldown("Off Cancelled", "Off Cancelled", "Dates where off was cancelled")}
-            />
-            <SummaryCard
-              title="PH Worked"
-              value={String(attendanceDrilldownSummary.phWorked)}
-              subtitle="PH earned"
-              onPress={() => openAttendanceDrilldown("PH Worked", "PH Worked", "Public holiday worked dates")}
-            />
-            <SummaryCard
-              title="PH Comp Taken"
-              value={String(attendanceDrilldownSummary.phCompOffTaken)}
-              subtitle="PH used"
-              onPress={() => openAttendanceDrilldown("PH Comp Off Taken", "PH Comp Off Taken", "PH comp off used dates")}
-            />
-            <SummaryCard
-              title="Leave Days"
-              value={String(attendanceDrilldownSummary.leaveDays)}
-              subtitle="Annual/Sick/Emergency"
-              onPress={() => openAttendanceDrilldown("Leave Days", "Leave Days", "Leave dates in selected month")}
-            />
-            <SummaryCard
-              title="Late Days"
-              value={String(attendanceDrilldownSummary.lateDays)}
-              subtitle="After 08:30 AM"
-              onPress={() => openAttendanceDrilldown("Late Days", "Late Days", "Clock-in after duty start")}
-            />
-            <SummaryCard
-              title="Missing Punch"
-              value={String(attendanceDrilldownSummary.missingPunch)}
-              subtitle="Incomplete punch"
-              onPress={() => openAttendanceDrilldown("Missing Punch", "Missing Punch", "Missing clock-in or clock-out dates")}
-            />
-            <SummaryCard
-              title="Extra Used"
-              value={minutesToReadable(attendanceDrilldownSummary.extraUsedMinutes)}
-              subtitle="Hours used"
-              onPress={() => openAttendanceDrilldown("Extra Used", "Extra Hours Used", "Dates where extra hours were used")}
-            />
-          </View>
-
           <View style={styles.historyTitleRow}>
             <Text style={styles.sectionMiniTitle}>Recent Attendance History</Text>
             <Text style={styles.historyCountText}>{Math.min(monthRecords.length, 3)} / {monthRecords.length}</Text>
@@ -5188,64 +5678,6 @@ export default function App() {
             </Pressable>
           ) : null}
         </View>
-      </Page>
-    );
-  }
-
-  if (isLoggedIn && screen === "attendanceDrilldown") {
-    const drilldownTitle = attendanceDrilldown.title || "Attendance Details";
-    const drilldownSubtitle = attendanceDrilldown.subtitle || getMonthTitle(attendanceMonth.year, attendanceMonth.monthIndex);
-
-    return (
-      <Page
-        title={drilldownTitle}
-        subtitle={`${getMonthTitle(attendanceMonth.year, attendanceMonth.monthIndex)} • ${drilldownSubtitle}`}
-        onBack={goBack}
-      >
-        <View style={styles.editCard}>
-          <MonthNav
-            title={getMonthTitle(attendanceMonth.year, attendanceMonth.monthIndex)}
-            onPrev={() => moveAttendanceMonth(-1)}
-            onNext={() => moveAttendanceMonth(1)}
-          />
-          <View style={styles.historyFilterSummary}>
-            <InfoLine label="Selected Detail" value={drilldownTitle} />
-            <InfoLine label="Matching Dates" value={String(attendanceDrilldownRecords.length)} />
-          </View>
-          <Text style={styles.noteHelpText}>This page shows the exact dates behind the selected attendance summary card.</Text>
-        </View>
-
-        {attendanceDrilldownRecords.length === 0 ? (
-          <EmptyBox title="No matching dates" text="No attendance record found for this selection in the current month." />
-        ) : null}
-
-        {attendanceDrilldownRecords.map((record) => {
-          const rowData = buildAttendanceTimesheetRow(record);
-          const extraEarnedMinutes = record.checkIn && record.checkOut
-            ? calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours)
-            : 0;
-          const extraUsedMinutes = hoursTextToMinutes(record.extraHoursUsed);
-          const checkInMinutes = timeToMinutes(record.checkIn);
-          const checkOutMinutes = timeToMinutes(record.checkOut);
-          const lateMinutes = checkInMinutes !== null ? Math.max(checkInMinutes - DAILY_DUTY_START_MINUTES, 0) : 0;
-          const earlyMinutes = checkOutMinutes !== null ? Math.max(DAILY_DUTY_END_MINUTES - checkOutMinutes, 0) : 0;
-          const hasMissingPunch = isAttendanceMissingPunch(record);
-
-          return (
-            <View key={`${record.date}-${record.dayType}`} style={styles.historyRowLarge}>
-              <Text style={styles.historyTitle}>{formatDateForDisplay(record.date)} • {record.dayType}</Text>
-              <Text style={styles.historyText}>Clock In: {record.checkIn ? formatDisplayTime(record.checkIn) : "--"} • Clock Out: {record.checkOut ? formatDisplayTime(record.checkOut) : "--"}</Text>
-              <Text style={styles.historyText}>Status: {record.status || "--"}</Text>
-              <Text style={styles.historyText}>Work Time: {rowData.workTime} • Actual Time: {rowData.actualTime} • Overtime: {rowData.overtime}</Text>
-              {lateMinutes > 0 ? <Text style={styles.historyText}>Late: {minutesToReadable(lateMinutes)}</Text> : null}
-              {earlyMinutes > 0 ? <Text style={styles.historyText}>Early Out: {minutesToReadable(earlyMinutes)}</Text> : null}
-              {extraEarnedMinutes > 0 ? <Text style={styles.historyText}>Extra Earned: {minutesToReadable(extraEarnedMinutes)}</Text> : null}
-              {extraUsedMinutes > 0 ? <Text style={styles.historyText}>Extra Used: {minutesToReadable(extraUsedMinutes)}</Text> : null}
-              {hasMissingPunch ? <Text style={styles.historyText}>Missing Punch: Yes</Text> : null}
-              {record.note ? <Text style={styles.historyNote}>Notes: {record.note}</Text> : null}
-            </View>
-          );
-        })}
       </Page>
     );
   }
@@ -5438,6 +5870,28 @@ export default function App() {
   }
 
   if (isLoggedIn && screen === "pettyCash") {
+    // Lists show this calendar month only; search looks through every month.
+    const pettyListMonth = getCurrentMonthRange();
+    const pettyListMonthTitle = getMonthTitle(new Date().getFullYear(), new Date().getMonth());
+    const latestPettyClosing = getLatestPettyClosing(pettyClosings);
+    // Missed entries (back-dated, still open) are shown too, because they count in the balance above.
+    const inPettyListScope = (record) => pettyCashSearchActive
+      || isDateInRange(record.date, pettyListMonth.from, pettyListMonth.to)
+      || (record.lateEntry && isPettyRecordOpen(record, latestPettyClosing));
+    const byDateDesc = (a, b) => {
+      const dateCompare = String(b.date || "").localeCompare(String(a.date || ""));
+      return dateCompare !== 0 ? dateCompare : Number(b.id || 0) - Number(a.id || 0);
+    };
+    const listExpenses = filteredPettyCashExpenses.filter(inPettyListScope).sort(byDateDesc);
+    const listTransfers = filteredCashTransfers.filter(inPettyListScope).sort(byDateDesc);
+    const listReceived = filteredCashReceivedRecords.filter(inPettyListScope).sort(byDateDesc);
+    const pettyRecordTag = (record) => {
+      if (isPettyRecordOpen(record, latestPettyClosing)) return record.lateEntry ? "Missed entry • counted in open period" : "";
+      return "Closed period";
+    };
+    const listScopeText = pettyCashSearchActive ? "all months" : pettyListMonthTitle;
+    const sumOf = (records, field) => roundMoney(records.reduce((sum, record) => sum + toNumber(record[field]), 0));
+
     return (
       <Page title="Petty Cash" subtitle="Current open period, expenses and transfers" onBack={goBack} rightText="Report" onRight={() => setScreen("pettyReport")}>
         <View style={styles.moneyCard}>
@@ -5485,10 +5939,10 @@ export default function App() {
           )}
         </View>
 
-        <Text style={styles.sectionTitle}>Latest Expenses</Text>
-        {pettyCashExpenses.length === 0 ? <EmptyBox title="No expenses yet" text="Add supplier invoice expenses." /> : null}
-        {pettyCashExpenses.length > 0 && filteredPettyCashExpenses.length === 0 ? <EmptyBox title="No matching expenses" text="No expense matches your search." /> : null}
-        {filteredPettyCashExpenses.slice(0, 20).map((expense) => (
+        <Text style={styles.sectionTitle}>Expenses • {listScopeText}</Text>
+        <Text style={styles.pettySearchMeta}>{listExpenses.length} records • {formatAED(sumOf(listExpenses, "totalAmount"))}{pettyCashSearchActive ? "" : " • Older months: Report"}</Text>
+        {listExpenses.length === 0 ? <EmptyBox title={pettyCashSearchActive ? "No matching expenses" : "No expenses this month"} text={pettyCashSearchActive ? "No expense matches your search." : "Add supplier invoice expenses."} /> : null}
+        {listExpenses.map((expense) => (
           <View key={expense.id} style={styles.expenseCard}>
             <View style={styles.rowBetween}>
               <View style={{ flex: 1 }}><Text style={styles.expenseSupplier}>{expense.supplier}</Text><Text style={styles.expenseDescription}>{expense.itemDescription}</Text></View>
@@ -5498,6 +5952,7 @@ export default function App() {
             {expense.bcBranchCode ? <Text style={styles.expenseMeta}>BC Branch: {expense.bcBranchCode}</Text> : null}
             <Text style={styles.expenseMeta}>Ex.VAT {formatAED(expense.amountExVat)} • VAT {formatAED(expense.vatAmount)} • {expense.vatType}</Text>
             {expense.paidBy ? <Text style={styles.expenseMeta}>Paid / Handled By: {expense.paidBy}</Text> : null}
+            {pettyRecordTag(expense) ? <Text style={styles.expenseMeta}>{pettyRecordTag(expense)}</Text> : null}
             <View style={styles.cardActionRow}>
               <Pressable style={styles.editMiniButton} onPress={() => openEditPettyExpense(expense)}><Text style={styles.editMiniButtonText}>Edit</Text></Pressable>
               <Pressable style={styles.deleteMiniButton} onPress={() => deletePettyExpense(expense.id)}><Text style={styles.deleteMiniButtonText}>Delete</Text></Pressable>
@@ -5505,10 +5960,9 @@ export default function App() {
           </View>
         ))}
 
-        <Text style={styles.sectionTitle}>Cash Transfers</Text>
-        {cashTransfers.length === 0 ? <EmptyBox title="No transfers yet" text="Use transfer when petty cash is handed over or returned." /> : null}
-        {cashTransfers.length > 0 && filteredCashTransfers.length === 0 ? <EmptyBox title="No matching transfers" text="No cash transfer matches your search." /> : null}
-        {filteredCashTransfers.slice(0, 20).map((transfer) => (
+        <Text style={styles.sectionTitle}>Cash Transfers • {listScopeText}</Text>
+        {listTransfers.length === 0 ? <EmptyBox title={pettyCashSearchActive ? "No matching transfers" : "No transfers this month"} text={pettyCashSearchActive ? "No cash transfer matches your search." : "Use transfer when petty cash is handed over or returned."} /> : null}
+        {listTransfers.map((transfer) => (
           <View key={transfer.id} style={styles.transferCard}>
             <View style={styles.rowBetween}>
               <View style={{ flex: 1 }}><Text style={styles.expenseSupplier}>{transfer.transferType}</Text><Text style={styles.expenseDescription}>{transfer.personName}</Text></View>
@@ -5516,6 +5970,7 @@ export default function App() {
             </View>
             <Text style={styles.expenseMeta}>{formatDateForDisplay(transfer.date)} • {transfer.purpose || "No purpose"}</Text>
             {transfer.closingId ? <Text style={styles.expenseMeta}>Created by Month Closing</Text> : null}
+            {!transfer.closingId && pettyRecordTag(transfer) ? <Text style={styles.expenseMeta}>{pettyRecordTag(transfer)}</Text> : null}
             <View style={styles.cardActionRow}>
               <Pressable style={styles.editMiniButton} onPress={() => openEditCashTransfer(transfer)}><Text style={styles.editMiniButtonText}>Edit</Text></Pressable>
               <Pressable style={styles.deleteMiniButton} onPress={() => deleteCashTransfer(transfer.id)}><Text style={styles.deleteMiniButtonText}>Delete</Text></Pressable>
@@ -5523,20 +5978,43 @@ export default function App() {
           </View>
         ))}
 
-        <Text style={styles.sectionTitle}>Received Cash</Text>
-        {cashReceivedRecords.length === 0 ? <EmptyBox title="No received cash record" text="Add the amount received from office." /> : null}
-        {cashReceivedRecords.length > 0 && filteredCashReceivedRecords.length === 0 ? <EmptyBox title="No matching received cash" text="No received cash record matches your search." /> : null}
-        {filteredCashReceivedRecords.slice(0, 10).map((record) => (
+        <Text style={styles.sectionTitle}>Received Cash • {listScopeText}</Text>
+        {listReceived.length === 0 ? <EmptyBox title={pettyCashSearchActive ? "No matching received cash" : "No cash received this month"} text={pettyCashSearchActive ? "No received cash record matches your search." : "Add the amount received from office."} /> : null}
+        {listReceived.map((record) => (
           <View key={record.id} style={styles.receivedCard}>
             <Text style={styles.receivedAmount}>{formatAED(record.amount)}</Text>
             <Text style={styles.receivedMeta}>{formatDateForDisplay(record.date)} • {record.receivedFrom}</Text>
             {record.notes ? <Text style={styles.receivedNote}>{record.notes}</Text> : null}
+            {pettyRecordTag(record) ? <Text style={styles.receivedNote}>{pettyRecordTag(record)}</Text> : null}
             <View style={styles.cardActionRow}>
               <Pressable style={styles.editMiniButton} onPress={() => openEditCashReceived(record)}><Text style={styles.editMiniButtonText}>Edit</Text></Pressable>
               <Pressable style={styles.deleteMiniButton} onPress={() => deleteCashReceived(record.id)}><Text style={styles.deleteMiniButtonText}>Delete</Text></Pressable>
             </View>
           </View>
         ))}
+
+        <Text style={styles.sectionTitle}>Monthly Submission</Text>
+        {getPettySubmissionMonths().map((month) => {
+          const submission = pettySubmissions.find((item) => item.month === month.key);
+          return (
+            <View key={month.key} style={[styles.pettySubmissionRow, { borderLeftColor: submission ? "#2E9E6B" : "#E8A13A" }]}>
+              <View style={styles.rowBetween}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.expenseSupplier}>{month.title}</Text>
+                  <Text style={[styles.expenseMeta, submission ? styles.claimStatusReceived : styles.claimStatusWaiting]}>
+                    {submission ? `Submitted on ${formatDateForDisplay(submission.submittedDate)}` : "Not submitted"}
+                  </Text>
+                </View>
+                <Pressable
+                  style={styles.editMiniButton}
+                  onPress={() => (submission ? undoPettySubmission(month) : markPettySubmitted(month))}
+                >
+                  <Text style={styles.editMiniButtonText}>{submission ? "Undo" : "Mark Submitted"}</Text>
+                </Pressable>
+              </View>
+            </View>
+          );
+        })}
       </Page>
     );
   }
@@ -5817,9 +6295,76 @@ export default function App() {
 
 
   if (isLoggedIn && screen === "reimbursement") {
-    const latestRecords = [...reimbursementRecords]
-      .filter((record) => reimbursementFilterMatches(record, reimbursementFilter))
-      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    // Open = not yet submitted in a claim. Once a claim is submitted its records leave this list
+    // and the claim shows below with "Payment Received" until the money comes.
+    const nextClaimRange = getNextClaimRange(reimbursementClaims);
+    const byNewest = (a, b) => String(b.date).localeCompare(String(a.date)) || Number(b.id || 0) - Number(a.id || 0);
+    const openRecords = reimbursementRecords
+      .filter((record) => !record.claimId && (record.status || "Pending") === "Pending")
+      .sort(byNewest);
+    const openFiltered = openRecords.filter((record) => reimbursementFilterMatches(record, reimbursementFilter));
+    const openReport = getReimbursementReportByDateRange(openRecords, "0000-01-01", "9999-12-31");
+    const earlierOpenCount = openRecords.filter((record) => String(record.date || "") < nextClaimRange.from).length;
+    const waitingClaims = reimbursementClaimHistory.filter((claim) => claim.status !== "Reimbursed");
+    const waitingTotal = roundMoney(waitingClaims.reduce((sum, claim) => sum + toNumber(claim.totalAmount), 0));
+    const receivedClaims = reimbursementClaimHistory.filter((claim) => claim.status === "Reimbursed").slice(0, 3);
+    const lastReceived = receivedClaims[0];
+    const renderReimbursementCard = (record) => (
+      <View key={record.id} style={styles.expenseCard}>
+        <View style={styles.rowBetween}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.expenseSupplier}>{record.expenseType}</Text>
+            <Text style={styles.expenseDescription}>{record.purpose}</Text>
+          </View>
+          <Text style={styles.expenseAmount}>{formatAED(record.amount)}</Text>
+        </View>
+        <Text style={styles.expenseMeta}>{formatDateForDisplay(record.date)} • {record.company} • {record.branch}</Text>
+        {record.bcBranchCode ? <Text style={styles.expenseMeta}>BC Branch: {record.bcBranchCode}</Text> : null}
+        <Text style={styles.expenseMeta}>Receipt: {record.receiptNo || "--"}</Text>
+        {String(record.date || "") < nextClaimRange.from ? (
+          <Text style={styles.expenseMeta}>Older than this period • include it in the next claim</Text>
+        ) : null}
+        {record.notes ? <Text style={styles.expenseMeta}>Notes: {record.notes}</Text> : null}
+        <View style={styles.cardActionRow}>
+          <Pressable style={styles.editMiniButton} onPress={() => openEditReimbursement(record)}>
+            <Text style={styles.editMiniButtonText}>Edit</Text>
+          </Pressable>
+          <Pressable style={styles.deleteMiniButton} onPress={() => deleteReimbursementRecord(record.id)}>
+            <Text style={styles.deleteMiniButtonText}>Delete</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+    const renderClaimCard = (claim) => {
+      const received = claim.status === "Reimbursed";
+      return (
+        <View key={claim.id} style={[styles.expenseCard, received ? styles.claimCardReceived : styles.claimCardWaiting]}>
+          <View style={styles.rowBetween}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.expenseSupplier}>{claim.claimNo}</Text>
+              <Text style={styles.expenseDescription}>{formatDateForDisplay(claim.fromDate)} to {formatDateForDisplay(claim.toDate)}</Text>
+            </View>
+            <Text style={styles.expenseAmount}>{formatAED(claim.totalAmount)}</Text>
+          </View>
+          <Text style={styles.expenseMeta}>Submitted {formatDateForDisplay(claim.submitDate)} to {claim.submittedTo || "--"} • {claim.recordCount || 0} records</Text>
+          <Text style={[styles.expenseMeta, received ? styles.claimStatusReceived : styles.claimStatusWaiting]}>
+            {received ? `Payment received on ${formatDateForDisplay(claim.reimbursedDate)}` : "Waiting for payment"}
+          </Text>
+          <View style={styles.cardActionRow}>
+            {received ? (
+              <Pressable style={styles.editMiniButton} onPress={() => undoClaimReceived(claim.id)}>
+                <Text style={styles.editMiniButtonText}>Not Received</Text>
+              </Pressable>
+            ) : (
+              <Pressable style={styles.editMiniButton} onPress={() => markReimbursementClaimReimbursed(claim.id)}>
+                <Text style={styles.editMiniButtonText}>Payment Received</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+      );
+    };
+
     return (
       <Page
         title="Reimbursement"
@@ -5828,19 +6373,33 @@ export default function App() {
         rightText="Report"
         onRight={() => setScreen("reimbursementReport")}
       >
+        {waitingClaims.length > 0 ? (
+          <View style={styles.lateBanner}>
+            <Text style={styles.lateBannerTitle}>Waiting for payment: {formatAED(waitingTotal)}</Text>
+            <Text style={styles.lateBannerText}>
+              {waitingClaims.length} submitted claim{waitingClaims.length > 1 ? "s" : ""} not received yet. Tap "Payment Received" below when the money comes.
+            </Text>
+          </View>
+        ) : null}
+
         <View style={styles.moneyCard}>
-          <Text style={styles.moneyCardLabel}>Selected Period Claim</Text>
-          <Text style={styles.moneyCardValue}>{formatAED(reimbursementReport.totalClaim)}</Text>
+          <Text style={styles.moneyCardLabel}>Not Yet Submitted</Text>
+          <Text style={styles.moneyCardValue}>{formatAED(openReport.totalClaim)}</Text>
+          <Text style={styles.moneyCardSub}>Next claim: {getDateRangeTitle(nextClaimRange.from, nextClaimRange.to)}</Text>
           <Text style={styles.moneyCardSub}>
-            Transport {formatAED(reimbursementReport.totalTransportation)} • Food {formatAED(reimbursementReport.foodAccommodationTotal)} • Records {reimbursementReport.records.length}
+            Transport {formatAED(openReport.totalTransportation)} • Food {formatAED(openReport.foodAccommodationTotal)} • Records {openRecords.length}
           </Text>
         </View>
 
         <View style={styles.summaryGrid}>
-          <SummaryCard title="Pending" value={formatAED(reimbursementReport.pendingTotal)} subtitle="Not submitted" />
-          <SummaryCard title="Submitted" value={formatAED(reimbursementReport.submittedTotal)} subtitle="Waiting" />
-          <SummaryCard title="Reimbursed" value={formatAED(reimbursementReport.reimbursedTotal)} subtitle="Received" />
-          <SummaryCard title="Food / Stay" value={formatAED(reimbursementReport.foodAccommodationTotal)} subtitle="Period" />
+          <SummaryCard title="Not Submitted" value={formatAED(openReport.totalClaim)} subtitle={`${openRecords.length} records`} />
+          <SummaryCard title="Waiting Payment" value={formatAED(waitingTotal)} subtitle={`${waitingClaims.length} claims`} />
+          <SummaryCard
+            title="Last Received"
+            value={lastReceived ? formatAED(lastReceived.totalAmount) : "--"}
+            subtitle={lastReceived ? formatDateForDisplay(lastReceived.reimbursedDate) : "None yet"}
+          />
+          <SummaryCard title="Food / Stay" value={formatAED(openReport.foodAccommodationTotal)} subtitle="Not submitted" />
         </View>
 
         <View style={styles.actionColumn}>
@@ -5848,7 +6407,7 @@ export default function App() {
             <Text style={styles.actionButtonDarkText}>+ Add Reimbursement</Text>
           </Pressable>
           <Pressable style={styles.secondaryButton} onPress={openReimbursementClaimSettlement}>
-            <Text style={styles.secondaryButtonText}>Submit Claim / Settlement</Text>
+            <Text style={styles.secondaryButtonText}>Submit Claim (BC Export)</Text>
           </Pressable>
         </View>
 
@@ -5866,34 +6425,25 @@ export default function App() {
           </View>
         </View>
 
-        <Text style={styles.sectionTitle}>Latest Records</Text>
-        {latestRecords.length === 0 ? (
-          <EmptyBox title="No reimbursement records" text="Add parking, Salik, transportation or food claim entries here." />
+        <Text style={styles.sectionTitle}>Not Yet Submitted</Text>
+        {earlierOpenCount > 0 ? (
+          <Text style={styles.expenseMeta}>{earlierOpenCount} older record{earlierOpenCount > 1 ? "s were" : " was"} not in the last claim. Change the From Date when you submit to include {earlierOpenCount > 1 ? "them" : "it"}.</Text>
         ) : null}
-        {latestRecords.slice(0, 30).map((record) => (
-          <View key={record.id} style={styles.expenseCard}>
-            <View style={styles.rowBetween}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.expenseSupplier}>{record.expenseType}</Text>
-                <Text style={styles.expenseDescription}>{record.purpose}</Text>
-              </View>
-              <Text style={styles.expenseAmount}>{formatAED(record.amount)}</Text>
-            </View>
-            <Text style={styles.expenseMeta}>{formatDateForDisplay(record.date)} • {record.company} • {record.branch}</Text>
-            {record.bcBranchCode ? <Text style={styles.expenseMeta}>BC Branch: {record.bcBranchCode}</Text> : null}
-            <Text style={styles.expenseMeta}>Status: {record.status} • Receipt: {record.receiptNo || "--"}</Text>
-            {record.claimNo ? <Text style={styles.expenseMeta}>Claim: {record.claimNo}</Text> : null}
-            {record.notes ? <Text style={styles.expenseMeta}>Notes: {record.notes}</Text> : null}
-            <View style={styles.cardActionRow}>
-              <Pressable style={styles.editMiniButton} onPress={() => openEditReimbursement(record)}>
-                <Text style={styles.editMiniButtonText}>Edit</Text>
-              </Pressable>
-              <Pressable style={styles.deleteMiniButton} onPress={() => deleteReimbursementRecord(record.id)}>
-                <Text style={styles.deleteMiniButtonText}>Delete</Text>
-              </Pressable>
-            </View>
-          </View>
-        ))}
+        {openFiltered.length === 0 ? (
+          <EmptyBox title="Nothing to submit" text="Add parking, Salik, transport or food bills here. Submitted claims are listed below." />
+        ) : null}
+        {openFiltered.map(renderReimbursementCard)}
+
+        <Text style={styles.sectionTitle}>Submitted Claims</Text>
+        {waitingClaims.length === 0 && receivedClaims.length === 0 ? (
+          <EmptyBox title="No claims yet" text="Use Submit Claim when the period ends (24th to 23rd)." />
+        ) : null}
+        {waitingClaims.map(renderClaimCard)}
+        {receivedClaims.map(renderClaimCard)}
+        {reimbursementClaimHistory.length > waitingClaims.length + receivedClaims.length ? (
+          <Text style={styles.expenseMeta}>Older claims: Submit Claim page, Claim History</Text>
+        ) : null}
+        {claimReceivedModal}
       </Page>
     );
   }
@@ -6117,17 +6667,8 @@ export default function App() {
             placeholder="Optional ticket or receipt number"
           />
 
-          <Text style={styles.inputLabel}>Status</Text>
-          <View style={styles.optionRow}>
-            {["Pending", "Submitted", "Reimbursed"].map((item) => (
-              <OptionButton
-                key={item}
-                title={item}
-                active={newReimbursement.status === item}
-                onPress={() => setNewReimbursement({ ...newReimbursement, status: item })}
-              />
-            ))}
-          </View>
+          {/* Status is not chosen here: Submit Claim and Payment Received set it. */}
+          <Text style={styles.dateRangeHint}>Status: {newReimbursement.status || "Pending"} • set by Submit Claim and Payment Received</Text>
 
           <Input
             label="Notes"
@@ -6207,6 +6748,8 @@ export default function App() {
 
         <View style={styles.editCard}>
           <Text style={styles.sectionMiniTitle}>Backup Actions</Text>
+          <InfoLine label="Last backup" value={lastBackupDate ? formatDateForDisplay(lastBackupDate) : "No backup yet"} />
+          <Text style={styles.masterInfoText}>A reminder comes every week (1 PM) after your last backup. Choose Google Drive in the share menu to keep a copy off the phone.</Text>
           <Pressable style={styles.primaryButton} onPress={exportBackupJson}>
             <Text style={styles.primaryButtonText}>Export Backup JSON</Text>
           </Pressable>
@@ -6217,17 +6760,7 @@ export default function App() {
 
         <View style={styles.editCard}>
           <Text style={styles.sectionMiniTitle}>Security Settings</Text>
-          <View style={styles.securityStatusCard}>
-            <View style={styles.securityIconBox}>
-              <Text style={styles.securityIconText}>{biometricEnabled ? "🔐" : "🔓"}</Text>
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.securityTitle}>Biometric Login</Text>
-              <Text style={styles.securitySubtitle}>
-                Status: {biometricEnabled ? "Enabled" : "Disabled"}
-              </Text>
-            </View>
-          </View>
+          <InfoLine label="Biometric Login" value={biometricEnabled ? "Enabled" : "Disabled"} />
           <Text style={styles.masterInfoText}>
             Enable this to login with fingerprint, face unlock or your phone lock on this device. Username/password login will still work.
           </Text>
@@ -6244,10 +6777,10 @@ export default function App() {
 
         <View style={styles.editCard}>
           <Text style={styles.sectionMiniTitle}>Development Details</Text>
-          <InfoLine label="App Name" value="DailyTask" />
-          <InfoLine label="Developed by" value="Nousath Ali" />
           <InfoLine label="Powered by" value="Crescent IT Solution" />
+          <InfoLine label="Developed by" value="NousathAli" />
           <InfoLine label="Email" value="nousath24@hotmail.com" />
+          <InfoLine label="App Mode" value="Local mobile storage" />
         </View>
 
         <View style={styles.editCard}>
@@ -6563,6 +7096,15 @@ export default function App() {
             <Pressable style={styles.clockOutButton} onPress={handleClockOut}><Text style={styles.clockOutText}>Clock Out</Text></Pressable>
           </View>
           <Text style={styles.totalWorkedText}>Total Worked: {workedTimeText} • Extra Earned: {extraTimeText}</Text>
+          {showLateClockOutBanner ? (
+            <View style={styles.lateBanner}>
+              <Text style={styles.lateBannerTitle}>It is after 7 PM. Still working?</Text>
+              <Text style={styles.lateBannerText}>Clock out when you finish. You will be asked for a short note for the extra time.</Text>
+            </View>
+          ) : null}
+          {missedClockOutBanner}
+          {lateClockOutModal}
+          {missedClockOutModal}
         </View>
 
         <Text style={styles.sectionTitle}>Today Summary</Text>
@@ -6571,6 +7113,24 @@ export default function App() {
           <SummaryCard title="Follow Ups" value={String(todayFollowUpCount)} subtitle="Need action" onPress={() => setScreen("tasks")} />
           <SummaryCard title="Petty Cash" value={formatAED(pettyTotals.cashWithMe)} subtitle="Cash with me" onPress={() => setScreen("pettyCash")} />
           <SummaryCard title="Transfer" value={formatAED(pettyTotals.cashInTransfer)} subtitle="Cash outside" onPress={() => setScreen("pettyCash")} />
+        </View>
+
+        <Text style={styles.sectionTitle}>{monthlySummary.title}</Text>
+        <View style={styles.monthSummaryCard}>
+          <Pressable style={styles.monthSummaryItem} onPress={() => setScreen("attendance")}>
+            <Text style={styles.monthSummaryValue}>{minutesToReadable(monthlySummary.extraMinutes)}</Text>
+            <Text style={styles.monthSummaryLabel}>Extra time</Text>
+          </Pressable>
+          <View style={styles.monthSummaryDivider} />
+          <Pressable style={styles.monthSummaryItem} onPress={() => setScreen("pettyCash")}>
+            <Text style={styles.monthSummaryValue}>{formatAED(monthlySummary.pettySpent)}</Text>
+            <Text style={styles.monthSummaryLabel}>Petty cash spent</Text>
+          </Pressable>
+          <View style={styles.monthSummaryDivider} />
+          <Pressable style={styles.monthSummaryItem} onPress={() => setScreen("reimbursement")}>
+            <Text style={styles.monthSummaryValue}>{formatAED(monthlySummary.reimbursementDue)}</Text>
+            <Text style={styles.monthSummaryLabel}>Reimb. to get</Text>
+          </Pressable>
         </View>
 
         <Text style={styles.sectionTitle}>My Activity</Text>
@@ -7111,83 +7671,6 @@ function getMonthSummary(records) {
   return { totalRecords: records.length, workedDays, offDays, extraMinutes };
 }
 
-function isAttendanceWorkingType(record) {
-  return ["Work Day", "Off Cancelled", "PH Worked"].includes(record?.dayType || "Work Day");
-}
-
-function isAttendanceMissingPunch(record) {
-  if (!isAttendanceWorkingType(record)) return false;
-  const hasCheckIn = Boolean(record?.checkIn);
-  const hasCheckOut = Boolean(record?.checkOut);
-  return !hasCheckIn || !hasCheckOut;
-}
-
-function isAttendanceLate(record) {
-  if (!isAttendanceWorkingType(record)) return false;
-  const checkInMinutes = timeToMinutes(record?.checkIn);
-  if (checkInMinutes === null) return false;
-  return checkInMinutes > DAILY_DUTY_START_MINUTES;
-}
-
-function isAttendanceEarlyOut(record) {
-  if (!isAttendanceWorkingType(record)) return false;
-  const checkOutMinutes = timeToMinutes(record?.checkOut);
-  if (checkOutMinutes === null) return false;
-  return checkOutMinutes < DAILY_DUTY_END_MINUTES;
-}
-
-function isAttendanceLeaveDay(record) {
-  const dayType = record?.dayType || "";
-  return [
-    "Annual Leave",
-    "Sick Leave",
-    "Emergency Leave",
-    "Unpaid Leave",
-    "Other Leave",
-  ].includes(dayType);
-}
-
-function getAttendanceDrilldownSummary(records) {
-  const safeRecords = Array.isArray(records) ? records : [];
-  return {
-    pendingOffTaken: safeRecords.filter((record) => record.dayType === "Pending Off Taken").length,
-    offCancelled: safeRecords.filter((record) => record.dayType === "Off Cancelled").length,
-    phWorked: safeRecords.filter((record) => record.dayType === "PH Worked").length,
-    phCompOffTaken: safeRecords.filter((record) => record.dayType === "PH Comp Off Taken").length,
-    phOff: safeRecords.filter((record) => record.dayType === "PH Off").length,
-    leaveDays: safeRecords.filter(isAttendanceLeaveDay).length,
-    lateDays: safeRecords.filter(isAttendanceLate).length,
-    earlyOutDays: safeRecords.filter(isAttendanceEarlyOut).length,
-    missingPunch: safeRecords.filter(isAttendanceMissingPunch).length,
-    extraEarnedDays: safeRecords.filter((record) => record.checkIn && record.checkOut && calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours) > 0).length,
-    extraEarnedMinutes: safeRecords.reduce((sum, record) => (
-      sum + (record.checkIn && record.checkOut ? calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours) : 0)
-    ), 0),
-    extraUsedDays: safeRecords.filter((record) => hoursTextToMinutes(record.extraHoursUsed) > 0).length,
-    extraUsedMinutes: safeRecords.reduce((sum, record) => sum + hoursTextToMinutes(record.extraHoursUsed), 0),
-  };
-}
-
-function getAttendanceDrilldownRecords(records, type) {
-  const safeRecords = Array.isArray(records) ? records : [];
-
-  const matchedRecords = safeRecords.filter((record) => {
-    if (!type) return false;
-    if (ATTENDANCE_DAY_TYPES.includes(type)) return record.dayType === type;
-    if (type === "Leave Days") return isAttendanceLeaveDay(record);
-    if (type === "Late Days") return isAttendanceLate(record);
-    if (type === "Early Out") return isAttendanceEarlyOut(record);
-    if (type === "Missing Punch") return isAttendanceMissingPunch(record);
-    if (type === "Extra Earned") {
-      return record.checkIn && record.checkOut && calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours) > 0;
-    }
-    if (type === "Extra Used") return hoursTextToMinutes(record.extraHoursUsed) > 0;
-    return false;
-  });
-
-  return matchedRecords.sort((a, b) => String(a.date).localeCompare(String(b.date)));
-}
-
 function getCarryForwardBalance(records, year, monthIndex) {
   const selectedStartKey = dateToKey(new Date(year, monthIndex, 1));
   const selectedEndKey = dateToKey(new Date(year, monthIndex + 1, 0));
@@ -7331,12 +7814,40 @@ function filterRecordsFromDate(records, fromDate) {
   return safeRecords.filter((record) => String(record.date || "") >= fromDate);
 }
 
+// A petty cash record belongs to the open period unless a Month Closing has taken it.
+// - periodClosingId: stamped on every open record when a month is closed.
+// - lateEntry: a record added after a closing but dated on/before it (a missed bill).
+//   It still counts in the open period, so the balance stays correct.
+// - Older records (saved before these flags existed) fall back to the date rule.
+function isPettyRecordOpen(record, latestClosing) {
+  if (!record) return false;
+  if (record.periodClosingId) return false;
+  if (!latestClosing?.date) return true;
+  if (record.lateEntry) return true;
+  return String(record.date || "") > String(latestClosing.date);
+}
+
+// Flags for a record being saved. A closed record keeps its flags when edited.
+function getPettyPeriodFlags(existingRecord, newDate, closingRecords) {
+  const latestClosing = getLatestPettyClosing(closingRecords);
+  if (existingRecord && !isPettyRecordOpen(existingRecord, latestClosing)) {
+    return {
+      periodClosingId: existingRecord.periodClosingId,
+      lateEntry: existingRecord.lateEntry,
+      closedRecord: true,
+    };
+  }
+  const isLate = Boolean(latestClosing?.date) && String(newDate || "") <= String(latestClosing.date);
+  return { periodClosingId: undefined, lateEntry: isLate || undefined, closedRecord: false };
+}
+
 function getPettyCashOpenPeriodSummary(receivedRecords, expenseRecords, transferRecords, closingRecords) {
   const latestClosing = getLatestPettyClosing(closingRecords);
   const fromDate = latestClosing?.date ? getNextDateKey(latestClosing.date) : "";
-  const periodReceived = filterRecordsFromDate(receivedRecords, fromDate);
-  const periodExpenses = filterRecordsFromDate(expenseRecords, fromDate);
-  const periodTransfers = filterRecordsFromDate(transferRecords, fromDate);
+  const isOpen = (record) => isPettyRecordOpen(record, latestClosing);
+  const periodReceived = (Array.isArray(receivedRecords) ? receivedRecords : []).filter(isOpen);
+  const periodExpenses = (Array.isArray(expenseRecords) ? expenseRecords : []).filter(isOpen);
+  const periodTransfers = (Array.isArray(transferRecords) ? transferRecords : []).filter(isOpen);
 
   return {
     latestClosing,
@@ -7459,6 +7970,22 @@ function getClaimDateRangeForMonth(year, monthIndex) {
     from: dateToKey(new Date(year, monthIndex - 1, 24)),
     to: dateToKey(new Date(year, monthIndex, 23)),
   };
+}
+
+// Next claim period: the day after the latest claim's To Date, ending on the next 23rd.
+// With no claims yet, the normal 24th-to-23rd cycle.
+function getNextClaimRange(claims) {
+  const fallback = getDefaultClaimDateRange();
+  const latest = [...(Array.isArray(claims) ? claims : [])]
+    .filter((claim) => claim?.toDate)
+    .sort((a, b) => String(b.toDate).localeCompare(String(a.toDate)))[0];
+  if (!latest) return fallback;
+  const from = getNextDateKey(latest.toDate);
+  const fromDate = parseDateKey(from);
+  const to = fromDate.getDate() <= 23
+    ? dateToKey(new Date(fromDate.getFullYear(), fromDate.getMonth(), 23))
+    : dateToKey(new Date(fromDate.getFullYear(), fromDate.getMonth() + 1, 23));
+  return { from, to };
 }
 
 function getDefaultClaimDateRange() {
@@ -7872,35 +8399,7 @@ function formatDateForBc(dateKey) {
 }
 
 function getBcColumnWidths() {
-  return [
-    { wch: 12 },
-    { wch: 22 },
-    { wch: 14 },
-    { wch: 24 },
-    { wch: 16 },
-    { wch: 52 },
-    { wch: 26 },
-    { wch: 24 },
-    { wch: 24 },
-    { wch: 24 },
-    { wch: 24 },
-    { wch: 26 },
-    { wch: 14 },
-    { wch: 10 },
-    { wch: 14 },
-    { wch: 22 },
-    { wch: 18 },
-    { wch: 18 },
-    { wch: 18 },
-    { wch: 16 },
-    { wch: 18 },
-    { wch: 22 },
-    { wch: 14 },
-    { wch: 26 },
-    { wch: 22 },
-    { wch: 18 },
-    { wch: 22 },
-  ];
+  return BC_EXPORT_HEADERS.map((header) => ({ wch: BC_COLUMN_WIDTHS[header] || 18 }));
 }
 
 
@@ -7917,35 +8416,27 @@ function buildPettyCashBcRows(expenses, profileData) {
     const amountIncludingVat = roundMoney(expense.totalAmount || expense.invoiceAmount);
     const vatPercent = vatAmount > 0 ? 5 : 0;
 
-    rows.push([
-      "", // Line No.
-      BC_FIXED_EXPENSE_CODE, // Expense Code remains blank for petty cash
-      BC_FIXED_GL_NO,
-      BC_FIXED_GL_DESCRIPTION,
-      formatDateForBc(expense.date),
-      expense.itemDescription || expense.notes || "",
-      expense.supplier || "",
-      BC_FIXED_GEN_BUS_POSTING_GROUP,
-      BC_FIXED_VAT_BUS_POSTING_GROUP,
-      BC_FIXED_GEN_PROD_POSTING_GROUP,
-      getBcVatProdPostingGroup(vatAmount),
-      amountExVat,
-      BC_FIXED_LINE_AMOUNT,
-      vatPercent,
-      vatAmount,
-      amountIncludingVat,
-      getRecordBcBranchValue(expense),
-      "", // Employee Code stays blank for BC
-      expense.invoiceNumber || "",
-      "", // VAT No.
-      BC_FIXED_DEPARTMENT_CODE,
-      "", // Accommodation Code
-      BC_FIXED_ATTACHMENT,
-      "", // Subtotal Excl. VAT (AED)
-      "", // Total Excl. VAT (AED)
-      "", // Total VAT (AED)
-      "", // Total Incl. VAT (AED)
-    ]);
+    rows.push(buildBcRow({
+      "Expense Code": BC_FIXED_EXPENSE_CODE, // blank for petty cash
+      "G/L No.": BC_FIXED_GL_NO,
+      "G/L Description": BC_FIXED_GL_DESCRIPTION,
+      "Expense Date": formatDateForBc(expense.date),
+      "Work Description": expense.itemDescription || expense.notes || "",
+      "Vendor Name": expense.supplier || "",
+      "Expense Amount (Excl. VAT)": amountExVat,
+      "Line amount": BC_FIXED_LINE_AMOUNT,
+      "Gen. Bus. Posting Group": BC_FIXED_GEN_BUS_POSTING_GROUP,
+      "VAT Bus. Posting Group": BC_FIXED_VAT_BUS_POSTING_GROUP,
+      "Gen. Prod. Posting Group": BC_FIXED_GEN_PROD_POSTING_GROUP,
+      "VAT Prod. Posting Group": getBcVatProdPostingGroup(vatAmount),
+      "VAT %": vatPercent,
+      "VAT Amount": vatAmount,
+      "Amount Including VAT": amountIncludingVat,
+      "Invoice No.": expense.invoiceNumber || "",
+      "Branch": getRecordBcBranchValue(expense),
+      "Department Code": BC_FIXED_DEPARTMENT_CODE,
+      "Attachment": BC_FIXED_ATTACHMENT,
+    }));
   });
 
   return rows;
@@ -7958,35 +8449,25 @@ function buildReimbursementBcRows(records, profileData) {
     const description = buildReimbursementDescription(record);
     const vatBreakdown = getReimbursementBcVatBreakdown(record);
 
-    rows.push([
-      "", // Line No.
-      getReimbursementBcExpenseCode(record.expenseType),
-      "", // G/L No.
-      "", // G/L Description
-      formatDateForBc(record.date),
-      description,
-      getReimbursementBcVendorName(record.expenseType),
-      REIMBURSEMENT_BC_FIXED_GEN_BUS_POSTING_GROUP,
-      REIMBURSEMENT_BC_FIXED_VAT_BUS_POSTING_GROUP,
-      REIMBURSEMENT_BC_FIXED_GEN_PROD_POSTING_GROUP,
-      vatBreakdown.vatProdPostingGroup,
-      vatBreakdown.amountExVat,
-      BC_FIXED_LINE_AMOUNT,
-      vatBreakdown.vatPercent,
-      vatBreakdown.vatAmount,
-      vatBreakdown.amountIncludingVat,
-      getRecordBcBranchValue(record),
-      "", // Employee Code stays blank for BC
-      record.receiptNo || "",
-      "", // VAT No.
-      REIMBURSEMENT_BC_FIXED_DEPARTMENT_CODE,
-      "", // Accommodation Code
-      REIMBURSEMENT_BC_FIXED_ATTACHMENT,
-      "", // Subtotal Excl. VAT (AED)
-      "", // Total Excl. VAT (AED)
-      "", // Total VAT (AED)
-      "", // Total Incl. VAT (AED)
-    ]);
+    rows.push(buildBcRow({
+      "Expense Code": getReimbursementBcExpenseCode(record.expenseType),
+      "Expense Date": formatDateForBc(record.date),
+      "Work Description": description,
+      "Vendor Name": getReimbursementBcVendorName(record.expenseType),
+      "Expense Amount (Excl. VAT)": vatBreakdown.amountExVat,
+      "Line amount": BC_FIXED_LINE_AMOUNT,
+      "Gen. Bus. Posting Group": REIMBURSEMENT_BC_FIXED_GEN_BUS_POSTING_GROUP,
+      "VAT Bus. Posting Group": REIMBURSEMENT_BC_FIXED_VAT_BUS_POSTING_GROUP,
+      "Gen. Prod. Posting Group": REIMBURSEMENT_BC_FIXED_GEN_PROD_POSTING_GROUP,
+      "VAT Prod. Posting Group": vatBreakdown.vatProdPostingGroup,
+      "VAT %": vatBreakdown.vatPercent,
+      "VAT Amount": vatBreakdown.vatAmount,
+      "Amount Including VAT": vatBreakdown.amountIncludingVat,
+      "Invoice No.": record.receiptNo || "",
+      "Branch": getRecordBcBranchValue(record),
+      "Department Code": REIMBURSEMENT_BC_FIXED_DEPARTMENT_CODE,
+      "Attachment": REIMBURSEMENT_BC_FIXED_ATTACHMENT,
+    }));
   });
 
   return rows;
@@ -7996,6 +8477,35 @@ const DAILY_DUTY_END_MINUTES = 17 * 60 + 30;
 const DAILY_DUTY_BREAK_MINUTES = 60;
 const DAILY_DUTY_TIME_TEXT = "08:30 AM - 05:30 PM";
 const DAILY_DUTY_DURATION_TEXT = "09:00";
+
+// Until this hour, a shift clocked in yesterday and not clocked out stays the active day,
+// so a late return (for example 00:30) is saved on the day the shift started.
+const OVERNIGHT_CUTOFF_HOUR = 6;
+
+function pickActiveAttendance(records, current) {
+  const list = Array.isArray(records) ? records : [];
+  const now = new Date();
+  const todayKey = dateToKey(now);
+  const yesterdayKey = dateToKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1));
+  const isOpen = (record) => Boolean(record && record.checkIn && !record.checkOut);
+
+  if (now.getHours() < OVERNIGHT_CUTOFF_HOUR) {
+    const yesterday = current?.date === yesterdayKey ? current : list.find((record) => record.date === yesterdayKey);
+    if (isOpen(yesterday)) return { ...emptyAttendance, ...yesterday, date: yesterdayKey };
+  }
+  if (current?.date === todayKey) return { ...emptyAttendance, ...current, date: todayKey };
+  const todayRecord = list.find((record) => record.date === todayKey);
+  return todayRecord ? { ...emptyAttendance, ...todayRecord, date: todayKey } : { ...emptyAttendance, date: todayKey };
+}
+
+// Most recent day in the last 7 days with a clock-in but no clock-out (before the active day).
+function findMissedClockOut(records, activeDateKey) {
+  const now = new Date();
+  const weekAgoKey = dateToKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7));
+  return (Array.isArray(records) ? records : [])
+    .filter((record) => record.checkIn && !record.checkOut && record.date < activeDateKey && record.date >= weekAgoKey)
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)))[0] || null;
+}
 
 function getTodayKey() {
   return dateToKey(new Date());
@@ -8193,15 +8703,18 @@ function buildAttendanceTimesheetRow(record) {
 
   let totalPunchMinutes = checkOutMinutes - checkInMinutes;
   if (totalPunchMinutes < 0) totalPunchMinutes += 24 * 60;
+  // Clock out after midnight: count the out time on the same work day (e.g. 00:30 = 24:30).
+  const checkOutOnWorkDay = checkInMinutes + totalPunchMinutes;
 
   const lateMinutes = Math.max(checkInMinutes - DAILY_DUTY_START_MINUTES, 0);
-  const earlyMinutes = Math.max(DAILY_DUTY_END_MINUTES - checkOutMinutes, 0);
-  const overtimeMinutes = Math.max(checkOutMinutes - DAILY_DUTY_END_MINUTES, 0);
+  const earlyMinutes = Math.max(DAILY_DUTY_END_MINUTES - checkOutOnWorkDay, 0);
+  // Same extra-time rule as the dashboard: time worked beyond the normal duty hours.
+  const overtimeMinutes = calculateExtraMinutes(record.checkIn, record.checkOut, record.normalDutyHours || "9");
   const breakMinutes = totalPunchMinutes > DAILY_DUTY_BREAK_MINUTES ? DAILY_DUTY_BREAK_MINUTES : 0;
   const workMinutes = Math.max(totalPunchMinutes - breakMinutes, 0);
 
   const actualStart = Math.max(checkInMinutes, DAILY_DUTY_START_MINUTES);
-  const actualEnd = Math.min(checkOutMinutes, DAILY_DUTY_END_MINUTES);
+  const actualEnd = Math.min(checkOutOnWorkDay, DAILY_DUTY_END_MINUTES);
   const actualRawMinutes = Math.max(actualEnd - actualStart, 0);
   const actualBreakMinutes = actualRawMinutes > DAILY_DUTY_BREAK_MINUTES ? DAILY_DUTY_BREAK_MINUTES : 0;
   const actualMinutes = Math.max(actualRawMinutes - actualBreakMinutes, 0);
@@ -8222,6 +8735,54 @@ function buildAttendanceTimesheetRow(record) {
 const androidTopPadding = Platform.OS === "android" ? StatusBar.currentHeight || 24 : 0;
 
 const styles = StyleSheet.create({
+  resetAppHint: { fontSize: 12, color: "#6C8A91", textAlign: "center", marginBottom: 8 },
+  resetAppButton: { borderWidth: 1, borderColor: "#E5A3A3", borderRadius: 14, paddingVertical: 12, alignItems: "center" },
+  resetAppButtonText: { color: "#B33A3A", fontWeight: "800", fontSize: 14 },
+  monthSummaryCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderRadius: 20,
+    paddingVertical: 14,
+    paddingHorizontal: 8,
+    shadowColor: "#0F3F45",
+    shadowOpacity: 0.06,
+    shadowRadius: 14,
+    elevation: 3,
+  },
+  monthSummaryItem: { flex: 1, alignItems: "center", paddingHorizontal: 4 },
+  monthSummaryValue: { fontSize: 15, fontWeight: "900", color: "#0E3B43", textAlign: "center" },
+  monthSummaryLabel: { marginTop: 4, fontSize: 11, fontWeight: "700", color: "#6C8A91", textAlign: "center" },
+  monthSummaryDivider: { width: 1, alignSelf: "stretch", backgroundColor: "#E3EEF0" },
+  claimCardWaiting: { borderLeftWidth: 4, borderLeftColor: "#E8A13A" },
+  claimCardReceived: { borderLeftWidth: 4, borderLeftColor: "#2E9E6B" },
+  claimStatusWaiting: { color: "#8A4B00", fontWeight: "800" },
+  claimStatusReceived: { color: "#1E7A50", fontWeight: "800" },
+  pettySubmissionRow: { marginTop: 8, padding: 12, borderRadius: 14, backgroundColor: "#FFFFFF", borderLeftWidth: 4 },
+  lateBanner: {
+    marginTop: 12,
+    padding: 12,
+    borderRadius: 14,
+    backgroundColor: "#FFF4E5",
+    borderWidth: 1,
+    borderColor: "#F5C27A",
+  },
+  lateBannerTitle: { fontSize: 14, fontWeight: "800", color: "#8A4B00" },
+  lateBannerText: { marginTop: 4, fontSize: 12, color: "#8A4B00" },
+  lateNoteLabel: { alignSelf: "stretch", marginTop: 6, marginBottom: 6, fontSize: 13, fontWeight: "700", color: "#0E3B43" },
+  lateNoteInput: {
+    alignSelf: "stretch",
+    minHeight: 70,
+    borderWidth: 1,
+    borderColor: "#CFE0E4",
+    borderRadius: 12,
+    padding: 10,
+    fontSize: 14,
+    color: "#0E3B43",
+    backgroundColor: "#F7FBFC",
+    textAlignVertical: "top",
+    marginBottom: 12,
+  },
   safeArea: { flex: 1, backgroundColor: "#EEF5F7", paddingTop: androidTopPadding },
   darkSafeArea: { flex: 1, backgroundColor: "#0E3B43", paddingTop: androidTopPadding },
   loadingScreen: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
@@ -8238,13 +8799,6 @@ const styles = StyleSheet.create({
   primaryButtonText: { color: "#FFFFFF", fontSize: 16, fontWeight: "800" },
   secondaryButton: { backgroundColor: "#E7F1F3", paddingVertical: 15, borderRadius: 13, alignItems: "center", marginTop: 12 },
   secondaryButtonText: { color: "#1597A5", fontSize: 16, fontWeight: "800" },
-  dangerSoftButton: { backgroundColor: "#FFE9DD", borderWidth: 1, borderColor: "#FFD0BE", paddingVertical: 15, borderRadius: 13, alignItems: "center", marginTop: 14 },
-  dangerSoftButtonText: { color: "#C75B39", fontSize: 16, fontWeight: "900" },
-  securityStatusCard: { backgroundColor: "#F4FBFC", borderWidth: 1, borderColor: "#DDECEF", borderRadius: 18, padding: 14, flexDirection: "row", alignItems: "center", gap: 12, marginBottom: 8 },
-  securityIconBox: { width: 46, height: 46, borderRadius: 16, backgroundColor: "#DDF3F6", alignItems: "center", justifyContent: "center" },
-  securityIconText: { fontSize: 22 },
-  securityTitle: { color: "#17252A", fontSize: 15, fontWeight: "900" },
-  securitySubtitle: { color: "#55727B", fontSize: 12, fontWeight: "700", marginTop: 3 },
   dashboardButton: { backgroundColor: "#FFFFFF", paddingVertical: 15, borderRadius: 15, alignItems: "center", marginTop: 14, borderWidth: 1, borderColor: "#DDE8EC" },
   dashboardButtonText: { color: "#17252A", fontSize: 15, fontWeight: "900" },
   dangerButton: { backgroundColor: "#FFE9DD", paddingVertical: 15, borderRadius: 15, alignItems: "center", marginTop: 14 },
