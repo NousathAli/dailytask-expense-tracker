@@ -121,14 +121,14 @@ For expenses you paid from your own money.
 
 **Submit a claim**
 1. **Pending Records to Submit** lists every expense that is not yet claimed.
-2. Choose the **Claim Date Range** and check the **Monthly claim preview**.
-3. Tap **Submit Claim**. The records are grouped into one claim batch.
+2. The **Claim Period** is filled in for you. It runs from your oldest unsubmitted bill up to today, so a missed bill from an earlier period is included automatically. You can change the dates if you need to. Check the **Monthly claim preview**.
+3. Tap **Submit Claim**. The records are grouped into one claim batch. The current period closes today, and the next one starts tomorrow.
 4. Use **Export Claim Excel** for the claim form, or **Export Claim BC Excel** for the Business Central import file.
 
 **Track payment**
-- Submitted claims appear under **Waiting Payment**.
-- When the money arrives, tap **Payment Received** and enter the date. The claim and its records are then marked as reimbursed.
-- **Claim History** keeps every past claim.
+- Submitted claims appear under **Waiting for Payment** on the Reimbursement screen.
+- When the money arrives, tap **Payment Received** and enter the date. The claim and its records are then marked as reimbursed, and the claim leaves the main screen.
+- **Report → Claim History** keeps every claim, grouped by month, with the submitted, received and waiting totals and the payment date.
 
 ## 8. Master Data
 

@@ -50,3 +50,7 @@ yarn-error.*
 reference/
 CLAUDE.md
 AGENTS.md
+
+# exported data files (company data, Office lock files)
+exports/
+~$*

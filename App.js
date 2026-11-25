@@ -4170,7 +4170,7 @@ export default function App() {
 
   function resetReimbursementClaimForm() {
     // Next claim starts the day after the last submitted claim (default cycle 24th to 23rd).
-    const nextRange = getNextClaimRange(reimbursementClaims);
+    const nextRange = getNextClaimRange(reimbursementClaims, reimbursementRecords);
     setNewReimbursementClaim({
       ...emptyReimbursementClaim,
       fromDate: nextRange.from,
@@ -4329,7 +4329,7 @@ export default function App() {
       id: claimId,
       claimNo,
       fromDate,
-      toDate,
+      toDate: String(toDate) > String(submitDate) ? submitDate : toDate,
       submitDate,
       submittedTo,
       status: "Submitted",
@@ -6297,18 +6297,16 @@ export default function App() {
   if (isLoggedIn && screen === "reimbursement") {
     // Open = not yet submitted in a claim. Once a claim is submitted its records leave this list
     // and the claim shows below with "Payment Received" until the money comes.
-    const nextClaimRange = getNextClaimRange(reimbursementClaims);
+    const nextClaimRange = getNextClaimRange(reimbursementClaims, reimbursementRecords);
     const byNewest = (a, b) => String(b.date).localeCompare(String(a.date)) || Number(b.id || 0) - Number(a.id || 0);
     const openRecords = reimbursementRecords
       .filter((record) => !record.claimId && (record.status || "Pending") === "Pending")
       .sort(byNewest);
     const openFiltered = openRecords.filter((record) => reimbursementFilterMatches(record, reimbursementFilter));
     const openReport = getReimbursementReportByDateRange(openRecords, "0000-01-01", "9999-12-31");
-    const earlierOpenCount = openRecords.filter((record) => String(record.date || "") < nextClaimRange.from).length;
+    const earlierOpenCount = openRecords.filter((record) => String(record.date || "") < nextClaimRange.periodStart).length;
     const waitingClaims = reimbursementClaimHistory.filter((claim) => claim.status !== "Reimbursed");
     const waitingTotal = roundMoney(waitingClaims.reduce((sum, claim) => sum + toNumber(claim.totalAmount), 0));
-    const receivedClaims = reimbursementClaimHistory.filter((claim) => claim.status === "Reimbursed").slice(0, 3);
-    const lastReceived = receivedClaims[0];
     const renderReimbursementCard = (record) => (
       <View key={record.id} style={styles.expenseCard}>
         <View style={styles.rowBetween}>
@@ -6321,8 +6319,8 @@ export default function App() {
         <Text style={styles.expenseMeta}>{formatDateForDisplay(record.date)} • {record.company} • {record.branch}</Text>
         {record.bcBranchCode ? <Text style={styles.expenseMeta}>BC Branch: {record.bcBranchCode}</Text> : null}
         <Text style={styles.expenseMeta}>Receipt: {record.receiptNo || "--"}</Text>
-        {String(record.date || "") < nextClaimRange.from ? (
-          <Text style={styles.expenseMeta}>Older than this period • include it in the next claim</Text>
+        {String(record.date || "") < nextClaimRange.periodStart ? (
+          <Text style={styles.expenseMeta}>Missed from the last claim • it goes in the next claim</Text>
         ) : null}
         {record.notes ? <Text style={styles.expenseMeta}>Notes: {record.notes}</Text> : null}
         <View style={styles.cardActionRow}>
@@ -6383,9 +6381,9 @@ export default function App() {
         ) : null}
 
         <View style={styles.moneyCard}>
-          <Text style={styles.moneyCardLabel}>Not Yet Submitted</Text>
+          <Text style={styles.moneyCardLabel}>Current Period • Not Yet Submitted</Text>
           <Text style={styles.moneyCardValue}>{formatAED(openReport.totalClaim)}</Text>
-          <Text style={styles.moneyCardSub}>Next claim: {getDateRangeTitle(nextClaimRange.from, nextClaimRange.to)}</Text>
+          <Text style={styles.moneyCardSub}>Period from {formatDateForDisplay(nextClaimRange.periodStart)} • closes when you submit</Text>
           <Text style={styles.moneyCardSub}>
             Transport {formatAED(openReport.totalTransportation)} • Food {formatAED(openReport.foodAccommodationTotal)} • Records {openRecords.length}
           </Text>
@@ -6394,11 +6392,7 @@ export default function App() {
         <View style={styles.summaryGrid}>
           <SummaryCard title="Not Submitted" value={formatAED(openReport.totalClaim)} subtitle={`${openRecords.length} records`} />
           <SummaryCard title="Waiting Payment" value={formatAED(waitingTotal)} subtitle={`${waitingClaims.length} claims`} />
-          <SummaryCard
-            title="Last Received"
-            value={lastReceived ? formatAED(lastReceived.totalAmount) : "--"}
-            subtitle={lastReceived ? formatDateForDisplay(lastReceived.reimbursedDate) : "None yet"}
-          />
+          <SummaryCard title="Transport" value={formatAED(openReport.totalTransportation)} subtitle="Not submitted" />
           <SummaryCard title="Food / Stay" value={formatAED(openReport.foodAccommodationTotal)} subtitle="Not submitted" />
         </View>
 
@@ -6427,22 +6421,16 @@ export default function App() {
 
         <Text style={styles.sectionTitle}>Not Yet Submitted</Text>
         {earlierOpenCount > 0 ? (
-          <Text style={styles.expenseMeta}>{earlierOpenCount} older record{earlierOpenCount > 1 ? "s were" : " was"} not in the last claim. Change the From Date when you submit to include {earlierOpenCount > 1 ? "them" : "it"}.</Text>
+          <Text style={styles.expenseMeta}>{earlierOpenCount} older record{earlierOpenCount > 1 ? "s were" : " was"} not in any claim. The next Submit Claim includes {earlierOpenCount > 1 ? "them" : "it"} automatically.</Text>
         ) : null}
         {openFiltered.length === 0 ? (
           <EmptyBox title="Nothing to submit" text="Add parking, Salik, transport or food bills here. Submitted claims are listed below." />
         ) : null}
         {openFiltered.map(renderReimbursementCard)}
 
-        <Text style={styles.sectionTitle}>Submitted Claims</Text>
-        {waitingClaims.length === 0 && receivedClaims.length === 0 ? (
-          <EmptyBox title="No claims yet" text="Use Submit Claim when the period ends (24th to 23rd)." />
-        ) : null}
+        {waitingClaims.length > 0 ? <Text style={styles.sectionTitle}>Waiting for Payment</Text> : null}
         {waitingClaims.map(renderClaimCard)}
-        {receivedClaims.map(renderClaimCard)}
-        {reimbursementClaimHistory.length > waitingClaims.length + receivedClaims.length ? (
-          <Text style={styles.expenseMeta}>Older claims: Submit Claim page, Claim History</Text>
-        ) : null}
+        <Text style={styles.expenseMeta}>Paid claims leave this screen. See them in Report → Claim History.</Text>
         {claimReceivedModal}
       </Page>
     );
@@ -6453,7 +6441,7 @@ export default function App() {
       <Page title="Claim Settlement" subtitle="Submit reimbursement claim batch" onBack={goBack}>
         <View style={styles.editCard}>
           <Text style={styles.sectionMiniTitle}>Claim Period</Text>
-          <Text style={styles.dateRangeHint}>Default cycle: 24th to 23rd. You can change dates manually.</Text>
+          <Text style={styles.dateRangeHint}>Default: every bill not yet submitted, up to today. Submitting closes the period today and the next one starts tomorrow. You can change the dates.</Text>
           <DatePickerField
             label="From Date"
             value={newReimbursementClaim.fromDate}
@@ -6725,6 +6713,34 @@ export default function App() {
             <Text style={styles.secondaryButtonText}>Export BC Excel</Text>
           </Pressable>
         </View>
+
+        <Text style={styles.sectionTitle}>Claim History</Text>
+        {reimbursementClaimHistory.length === 0 ? (
+          <EmptyBox title="No claims yet" text="Claims you submit show here by month, with the payment date." />
+        ) : null}
+        {groupClaimsByMonth(reimbursementClaimHistory).map((group) => (
+          <View key={group.key} style={styles.editCard}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.sectionMiniTitle}>{group.title}</Text>
+              <Text style={styles.expenseAmount}>{formatAED(group.submittedTotal)}</Text>
+            </View>
+            <Text style={styles.expenseMeta}>
+              Received {formatAED(group.receivedTotal)}{group.waitingTotal > 0 ? ` • Waiting ${formatAED(group.waitingTotal)}` : ""}
+            </Text>
+            {group.claims.map((claim) => (
+              <View key={claim.id} style={styles.claimHistoryRow}>
+                <View style={styles.rowBetween}>
+                  <Text style={styles.expenseSupplier}>{claim.claimNo}</Text>
+                  <Text style={styles.expenseMeta}>{formatAED(claim.totalAmount)}</Text>
+                </View>
+                <Text style={styles.expenseMeta}>{formatDateForDisplay(claim.fromDate)} to {formatDateForDisplay(claim.toDate)} • {claim.recordCount || 0} records</Text>
+                <Text style={[styles.expenseMeta, claim.status === "Reimbursed" ? styles.claimStatusReceived : styles.claimStatusWaiting]}>
+                  Submitted {formatDateForDisplay(claim.submitDate)} • {claim.status === "Reimbursed" ? `Paid ${formatDateForDisplay(claim.reimbursedDate)}` : "Waiting for payment"}
+                </Text>
+              </View>
+            ))}
+          </View>
+        ))}
 
         <Text style={styles.sectionTitle}>Report Records</Text>
         {reimbursementReport.records.length === 0 ? (
@@ -7974,18 +7990,59 @@ function getClaimDateRangeForMonth(year, monthIndex) {
 
 // Next claim period: the day after the latest claim's To Date, ending on the next 23rd.
 // With no claims yet, the normal 24th-to-23rd cycle.
-function getNextClaimRange(claims) {
-  const fallback = getDefaultClaimDateRange();
-  const latest = [...(Array.isArray(claims) ? claims : [])]
-    .filter((claim) => claim?.toDate)
-    .sort((a, b) => String(b.toDate).localeCompare(String(a.toDate)))[0];
-  if (!latest) return fallback;
-  const from = getNextDateKey(latest.toDate);
-  const fromDate = parseDateKey(from);
-  const to = fromDate.getDate() <= 23
-    ? dateToKey(new Date(fromDate.getFullYear(), fromDate.getMonth(), 23))
-    : dateToKey(new Date(fromDate.getFullYear(), fromDate.getMonth() + 1, 23));
-  return { from, to };
+// A submitted claim closes the period on its To Date (never later than the day it was submitted).
+// The current period starts the next day. With no claims yet, the usual 24th-to-23rd cycle start.
+function getClaimEndDate(claim) {
+  const toDate = String(claim?.toDate || "");
+  const submitDate = String(claim?.submitDate || "");
+  if (toDate && submitDate && toDate > submitDate) return submitDate;
+  return toDate || submitDate;
+}
+
+// Default dates for the next claim:
+// - periodStart: the day after the last claim closed
+// - from: the oldest bill not yet submitted (so nothing is left behind), or periodStart
+// - to: today (submitting closes the period today)
+function getNextClaimRange(claims, records) {
+  const lastEnd = (Array.isArray(claims) ? claims : [])
+    .map(getClaimEndDate)
+    .filter(Boolean)
+    .sort()
+    .pop();
+  const periodStart = lastEnd ? getNextDateKey(lastEnd) : getDefaultClaimDateRange().from;
+  const oldestPending = (Array.isArray(records) ? records : [])
+    .filter((record) => !record.claimId && (record.status || "Pending") === "Pending" && record.date)
+    .map((record) => String(record.date))
+    .sort()[0];
+  const from = oldestPending && oldestPending < periodStart ? oldestPending : periodStart;
+  const today = getTodayKey();
+  return { from, to: today < from ? from : today, periodStart };
+}
+
+// Claims grouped by the month they were submitted, newest first, with totals.
+function groupClaimsByMonth(claims) {
+  const groups = {};
+  (Array.isArray(claims) ? claims : []).forEach((claim) => {
+    const key = String(claim.submitDate || "").slice(0, 7) || "unknown";
+    if (!groups[key]) groups[key] = { key, claims: [], submittedTotal: 0, receivedTotal: 0, waitingTotal: 0 };
+    const amount = toNumber(claim.totalAmount);
+    groups[key].claims.push(claim);
+    groups[key].submittedTotal += amount;
+    if (claim.status === "Reimbursed") groups[key].receivedTotal += amount;
+    else groups[key].waitingTotal += amount;
+  });
+  return Object.values(groups)
+    .sort((a, b) => b.key.localeCompare(a.key))
+    .map((group) => {
+      const [year, month] = group.key.split("-").map(Number);
+      return {
+        ...group,
+        title: year && month ? getMonthTitle(year, month - 1) : "Other",
+        submittedTotal: roundMoney(group.submittedTotal),
+        receivedTotal: roundMoney(group.receivedTotal),
+        waitingTotal: roundMoney(group.waitingTotal),
+      };
+    });
 }
 
 function getDefaultClaimDateRange() {
@@ -8735,6 +8792,7 @@ function buildAttendanceTimesheetRow(record) {
 const androidTopPadding = Platform.OS === "android" ? StatusBar.currentHeight || 24 : 0;
 
 const styles = StyleSheet.create({
+  claimHistoryRow: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: "#E3EEF0" },
   resetAppHint: { fontSize: 12, color: "#6C8A91", textAlign: "center", marginBottom: 8 },
   resetAppButton: { borderWidth: 1, borderColor: "#E5A3A3", borderRadius: 14, paddingVertical: 12, alignItems: "center" },
   resetAppButtonText: { color: "#B33A3A", fontWeight: "800", fontSize: 14 },
